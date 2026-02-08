@@ -1,0 +1,10 @@
+{
+  "name": "Truth Dare Telegram Bot",
+  "description": "Group game bot with XP, levels, moderation and analytics",
+  "repository": "https://github.com/YOUR_USERNAME/truth-dare-bot",
+  "env": {
+    "BOT_TOKEN": { "required": true },
+    "MONGO_URI": { "required": true },
+    "OWNER_ID": { "required": true }
+  }
+}
