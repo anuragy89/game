@@ -1,0 +1,82 @@
+{
+  "name": "XO Telegram Bot",
+  "description": "A production-ready Tic-Tac-Toe Telegram bot with PvP, AI, Tournaments, Coins, ELO and multi-language support.",
+  "keywords": ["telegram", "bot", "game", "tic-tac-toe", "xo", "python"],
+  "website": "",
+  "repository": "https://github.com/YOUR_USERNAME/xo-telegram-bot",
+  "logo": "https://i.imgur.com/placeholder.png",
+  "success_url": "/",
+
+  "stack": "heroku-24",
+
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ],
+
+  "env": {
+    "BOT_TOKEN": {
+      "description": "Your Telegram bot token from @BotFather (e.g. 123456:ABCdef...)",
+      "required": true
+    },
+    "BOT_USERNAME": {
+      "description": "Your bot's username WITHOUT the @ symbol (e.g. MyXOBot)",
+      "required": true
+    },
+    "MONGO_URI": {
+      "description": "MongoDB Atlas connection string (mongodb+srv://user:pass@cluster.mongodb.net/xobot)",
+      "required": true
+    },
+    "DB_NAME": {
+      "description": "MongoDB database name",
+      "value": "xobot",
+      "required": true
+    },
+    "UPDATE_CHANNEL": {
+      "description": "Your Telegram update channel username WITH @ (e.g. @MyBotUpdates)",
+      "required": true
+    },
+    "SUPPORT_USERNAME": {
+      "description": "Your Telegram support username WITHOUT @ (e.g. MySupport)",
+      "required": true
+    },
+    "OWNER_ID": {
+      "description": "Your personal Telegram user ID (get it from @userinfobot)",
+      "required": true
+    },
+    "BOT_THINK_DELAY": {
+      "description": "Seconds the bot 'thinks' before making a move (default: 1.2)",
+      "value": "1.2",
+      "required": false
+    },
+    "WEBHOOK_URL": {
+      "description": "Auto-set after deploy. Format: https://YOUR-APP-NAME.herokuapp.com — leave blank first, then set after deploy.",
+      "required": false
+    },
+    "PORT": {
+      "description": "Port for webhook server (Heroku sets this automatically)",
+      "value": "8443",
+      "required": false
+    }
+  },
+
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "standard-2x"
+    }
+  },
+
+  "addons": [],
+
+  "scripts": {},
+
+  "environments": {
+    "test": {
+      "scripts": {
+        "test": "python -m pytest tests/ -v"
+      }
+    }
+  }
+}
