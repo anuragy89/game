@@ -1,70 +1,67 @@
 """
-keyboards.py – All InlineKeyboardMarkup builders with color-coded emoji system.
+keyboards.py – All InlineKeyboardMarkup builders.
 
-Telegram's Bot API does not support background colours on inline buttons.
-The colour system here uses a consistent emoji palette to give each button
-a distinct visual identity:
+Real Telegram Bot API 9.4 button colours via api_kwargs={"style": "..."}:
+  "success" = green   → accept, join, easy, confirm
+  "danger"  = red     → decline, hard, cancel, revenge
+  "primary" = blue    → info, stats, navigation, play
 
-  🟢 GREEN   = Positive / Accept / Join / Easy
-  🔴 RED     = Danger / Decline / Quit / Hard / Delete
-  🟡 YELLOW  = Caution / Medium difficulty
-  🔵 BLUE    = Info / Stats / Navigation / Leaderboard
-  🟣 PURPLE  = Premium / Tournament / Special
-  🟠 ORANGE  = Action / Rematch / Play / Bet
-  ⚪ WHITE   = Neutral / Separator
-  💎 DIAMOND = Coins / Economy
+No emoji colour bubbles. Clean text labels only.
 """
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
 from config import UPDATE_CHANNEL, BOT_USERNAME, SUPPORT_USERNAME
 from game import EMPTY, CELL_EMOJI
 
 
-# ─────────────────────────────────────────────────────────
-#  MAIN MENU  (DM welcome screen)
-# ─────────────────────────────────────────────────────────
+def _b(text: str, data: str, style: str = "") -> InlineKeyboardButton:
+    if style:
+        return InlineKeyboardButton(text, callback_data=data, api_kwargs={"style": style})
+    return InlineKeyboardButton(text, callback_data=data)
 
+def _u(text: str, url: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text, url=url)
+
+
+# ─────────────────────────────────────────────────────────
+#  MAIN MENU
+# ─────────────────────────────────────────────────────────
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("➕ Add to Group",     url=f"https://t.me/{BOT_USERNAME}?startgroup=true"),
-            InlineKeyboardButton("📢 Updates Channel",  url=f"https://t.me/{UPDATE_CHANNEL.lstrip('@')}"),
+            _u("➕ Add to Group", f"https://t.me/{BOT_USERNAME}?startgroup=true"),
+            _u("📢 Updates",      f"https://t.me/{UPDATE_CHANNEL.lstrip('@')}"),
         ],
         [
-            InlineKeyboardButton("🔵 Help & Commands",  callback_data="cb_help"),
-            InlineKeyboardButton("🔵 My Stats",         callback_data="cb_stats"),
+            _b("Help & Commands", "cb_help",        "primary"),
+            _b("My Stats",        "cb_stats",        "primary"),
         ],
         [
-            InlineKeyboardButton("🟣 Leaderboard",      callback_data="cb_leaderboard"),
-            InlineKeyboardButton("🌐 Language",         callback_data="cb_language"),
+            _b("Leaderboard",     "cb_leaderboard",  "primary"),
+            _b("Language",        "cb_language"),
         ],
         [
-            InlineKeyboardButton("💬 Support",          url=f"https://t.me/{SUPPORT_USERNAME}"),
+            _u("Support", f"https://t.me/{SUPPORT_USERNAME}"),
         ],
     ])
 
 
-# ─────────────────────────────────────────────────────────
-#  GROUP WELCOME MENU
-# ─────────────────────────────────────────────────────────
-
 def group_welcome_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("⚔️ PvP Mode",         callback_data="cb_mode_pvp"),
-            InlineKeyboardButton("🤖 vs Bot",            callback_data="cb_mode_pve"),
+            _b("⚔️ PvP Challenge", "cb_mode_pvp",        "primary"),
+            _b("🤖 vs Bot",         "cb_mode_pve",        "primary"),
         ],
         [
-            InlineKeyboardButton("🟣 Tournament",        callback_data="cb_mode_tournament"),
-            InlineKeyboardButton("📅 Daily Challenge",   callback_data="cb_mode_daily"),
+            _b("🏆 Tournament",    "cb_mode_tournament",  "primary"),
+            _b("📅 Daily Puzzle",  "cb_mode_daily"),
         ],
         [
-            InlineKeyboardButton("🔵 My Stats",          callback_data="cb_stats"),
-            InlineKeyboardButton("🔵 Leaderboard",       callback_data="cb_leaderboard"),
+            _b("My Stats",         "cb_stats",            "primary"),
+            _b("Leaderboard",      "cb_leaderboard",      "primary"),
         ],
         [
-            InlineKeyboardButton("📢 Updates",           url=f"https://t.me/{UPDATE_CHANNEL.lstrip('@')}"),
+            _u("📢 Updates", f"https://t.me/{UPDATE_CHANNEL.lstrip('@')}"),
         ],
     ])
 
@@ -72,133 +69,108 @@ def group_welcome_kb() -> InlineKeyboardMarkup:
 # ─────────────────────────────────────────────────────────
 #  GAME BOARD
 # ─────────────────────────────────────────────────────────
-
 def board_kb(board: list, chat_id: int) -> InlineKeyboardMarkup:
-    """
-    3×3 board keyboard.
-    Empty cells show a wide space (tappable).
-    Filled cells show ❌ / ⭕ and are disabled (callback=noop).
-    """
     rows = []
     for r in range(3):
-        row_btns = []
+        row = []
         for c in range(3):
             idx  = r * 3 + c
             cell = board[idx]
             if cell == EMPTY:
-                row_btns.append(
-                    InlineKeyboardButton("　", callback_data=f"mv:{chat_id}:{idx}")
-                )
+                row.append(InlineKeyboardButton("　", callback_data=f"mv:{chat_id}:{idx}"))
             else:
-                row_btns.append(
-                    InlineKeyboardButton(CELL_EMOJI[cell], callback_data="noop")
-                )
-        rows.append(row_btns)
+                row.append(InlineKeyboardButton(CELL_EMOJI[cell], callback_data="noop"))
+        rows.append(row)
     return InlineKeyboardMarkup(rows)
 
 
 # ─────────────────────────────────────────────────────────
-#  CHALLENGE ACCEPT / DECLINE
+#  CHALLENGE
 # ─────────────────────────────────────────────────────────
-
 def challenge_kb(challenger_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🟢 Accept Challenge", callback_data=f"ch_accept:{challenger_id}"),
-        InlineKeyboardButton("🔴 Decline",          callback_data=f"ch_decline:{challenger_id}"),
+        _b("Accept",  f"ch_accept:{challenger_id}",  "success"),
+        _b("Decline", f"ch_decline:{challenger_id}", "danger"),
     ]])
 
 
 # ─────────────────────────────────────────────────────────
-#  DIFFICULTY PICKER
+#  PvE SETUP: DIFFICULTY → CHARACTER
 # ─────────────────────────────────────────────────────────
-
 def difficulty_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🟢 Easy",   callback_data="diff:easy"),
-        InlineKeyboardButton("🟡 Medium", callback_data="diff:medium"),
-        InlineKeyboardButton("🔴 Hard",   callback_data="diff:hard"),
+        _b("Easy",   "diff:easy",   "success"),
+        _b("Medium", "diff:medium"),
+        _b("Hard",   "diff:hard",   "danger"),
     ]])
 
-
-# ─────────────────────────────────────────────────────────
-#  POST-GAME: REMATCH + MENU
-# ─────────────────────────────────────────────────────────
-
-def rematch_kb(mode: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🟠 Rematch",   callback_data=f"rematch:{mode}"),
-        InlineKeyboardButton("🔵 Main Menu", callback_data="cb_main_menu"),
-    ]])
-
-
-# ─────────────────────────────────────────────────────────
-#  NAVIGATION: BACK BUTTON
-# ─────────────────────────────────────────────────────────
-
-def back_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("◀️ Back", callback_data="cb_main_menu"),
-    ]])
-
-
-# ─────────────────────────────────────────────────────────
-#  LANGUAGE PICKER
-# ─────────────────────────────────────────────────────────
-
-def language_kb() -> InlineKeyboardMarkup:
+def character_kb(difficulty: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🇬🇧 English", callback_data="lang:en"),
-            InlineKeyboardButton("🇸🇦 العربية", callback_data="lang:ar"),
-            InlineKeyboardButton("🇮🇳 हिंदी",   callback_data="lang:hi"),
+            _b("😈 The Devil",  f"char:{difficulty}:devil"),
+            _b("🤓 The Nerd",   f"char:{difficulty}:nerd"),
+            _b("😴 Grandma",    f"char:{difficulty}:grandma"),
         ],
         [
-            InlineKeyboardButton("◀️ Back",      callback_data="cb_main_menu"),
+            _b("Back to Difficulty", "cb_pick_difficulty"),
         ],
     ])
 
 
 # ─────────────────────────────────────────────────────────
-#  TOURNAMENT
+#  POST-GAME
 # ─────────────────────────────────────────────────────────
+def rematch_kb(mode: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        _b("Rematch",   f"rematch:{mode}", "primary"),
+        _b("Main Menu", "cb_main_menu"),
+    ]])
+
+def revenge_kb() -> InlineKeyboardMarkup:
+    """Shown when player loses to Hard bot — 2× coin multiplier."""
+    return InlineKeyboardMarkup([[
+        _b("REVENGE  ×2 Coins", "revenge", "danger"),
+        _b("Main Menu",         "cb_main_menu"),
+    ]])
+
+
+# ─────────────────────────────────────────────────────────
+#  NAV / LANG / TOURNAMENT / DAILY
+# ─────────────────────────────────────────────────────────
+def back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[_b("Back", "cb_main_menu")]])
+
+def language_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_b("English", "lang:en"), _b("العربية", "lang:ar"), _b("हिंदी", "lang:hi")],
+        [_b("Back", "cb_main_menu")],
+    ])
 
 def tourn_size_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🟣 4 Players",  callback_data="t_create:4"),
-        InlineKeyboardButton("🟣 8 Players",  callback_data="t_create:8"),
+        _b("4 Players", "t_create:4", "primary"),
+        _b("8 Players", "t_create:8", "primary"),
     ]])
-
 
 def tourn_lobby_kb(chat_id: int, creator_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🟢 Join Tournament",  callback_data=f"t_join:{chat_id}"),
-            InlineKeyboardButton("🟠 Start Now",         callback_data=f"t_start:{chat_id}"),
+            _b("Join",     f"t_join:{chat_id}",   "success"),
+            _b("Start Now", f"t_start:{chat_id}", "primary"),
         ],
-        [
-            InlineKeyboardButton("🔴 Cancel",            callback_data=f"t_cancel:{chat_id}"),
-        ],
+        [_b("Cancel", f"t_cancel:{chat_id}", "danger")],
     ])
-
-
-# ─────────────────────────────────────────────────────────
-#  DAILY CHALLENGE BOARD
-# ─────────────────────────────────────────────────────────
 
 def daily_board_kb(board: list, chat_id: int, puzzle_idx: int) -> InlineKeyboardMarkup:
     rows = []
     for r in range(3):
-        row_btns = []
+        row = []
         for c in range(3):
             idx  = r * 3 + c
             cell = board[idx]
             if cell == EMPTY:
-                row_btns.append(
-                    InlineKeyboardButton("　", callback_data=f"daily:{chat_id}:{puzzle_idx}:{idx}")
-                )
+                row.append(InlineKeyboardButton("　", callback_data=f"daily:{chat_id}:{puzzle_idx}:{idx}"))
             else:
-                row_btns.append(
-                    InlineKeyboardButton(CELL_EMOJI[cell], callback_data="noop")
-                )
-        rows.append(row_btns)
+                row.append(InlineKeyboardButton(CELL_EMOJI[cell], callback_data="noop"))
+        rows.append(row)
     return InlineKeyboardMarkup(rows)
