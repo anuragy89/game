@@ -3,7 +3,7 @@
 > **Production-ready Tic-Tac-Toe bot for Telegram groups.**
 > PvP · AI opponent · Tournaments · ELO · Coins · Multilingual
 
-[![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/YOUR_USERNAME/xo-telegram-bot)
+[![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/anuragy89/game)
 
 ---
 
