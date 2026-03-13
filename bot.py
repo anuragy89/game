@@ -163,7 +163,13 @@ def main() -> None:
     app = build_app()
 
     if USE_WEBHOOK:
-        logger.info(f"🚀 Starting in webhook mode on port {PORT}")
+        if not WEBHOOK_URL:
+            logger.error(
+                "WEBHOOK_URL is not set! "
+                "Run: heroku config:set WEBHOOK_URL=https://YOUR-APP.herokuapp.com"
+            )
+            raise SystemExit(1)
+        logger.info(f"Webhook mode -- port {PORT}  url {WEBHOOK_URL}")
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -172,7 +178,7 @@ def main() -> None:
             drop_pending_updates=True,
         )
     else:
-        logger.info("🚀 Starting in long-polling mode (local dev)")
+        logger.info("Polling mode (local development)")
         app.run_polling(drop_pending_updates=True)
 
 
