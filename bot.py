@@ -1,4 +1,15 @@
-"""bot.py — Entry point."""
+"""
+bot.py — Entry point.
+
+Inline mode is the primary way to play:
+  User types @BotName in any chat → picks game → board posted
+
+Commands still available for /stats, /daily, /coins, /help etc.
+/xo and /pvp also work in groups as fallback.
+
+allowed_updates includes inline_query + chosen_inline_result.
+"""
+
 import logging
 from telegram import BotCommand
 from telegram.ext import (
@@ -19,7 +30,9 @@ from handlers.game_handler import (
     handle_game_callbacks,
 )
 from handlers.inline_handler import (
-    handle_inline_query, handle_chosen_inline_result, handle_inline_callbacks,
+    handle_inline_query,
+    handle_chosen_inline_result,
+    handle_inline_callbacks,
 )
 from handlers.admin_handler      import cmd_broadcast, cmd_admin_stats
 from handlers.daily_handler      import cmd_daily, handle_daily_callback
@@ -44,7 +57,7 @@ COMMANDS = [
     BotCommand("tournament",  "🏆 Tournament bracket"),
     BotCommand("daily",       "📅 Daily puzzle (+coins)"),
     BotCommand("coins",       "💰 Coin balance"),
-    BotCommand("bet",         "Bet coins before a game"),
+    BotCommand("bet",         "Bet coins"),
     BotCommand("stats",       "📊 Stats & ELO"),
     BotCommand("top",         "🌍 Global leaderboard"),
     BotCommand("grouptop",    "Group leaderboard"),
@@ -57,7 +70,7 @@ async def post_init(app: Application) -> None:
     await ensure_indexes()
     await app.bot.set_my_commands(COMMANDS)
     info = await app.bot.get_me()
-    logger.info(f"Bot @{info.username} ready.")
+    logger.info(f"Bot @{info.username} ready. Inline mode active.")
 
 def build_app() -> Application:
     app = (
@@ -69,27 +82,41 @@ def build_app() -> Application:
 
     # Commands
     for cmd, fn in [
-        ("start", cmd_start), ("help", cmd_help), ("stats", cmd_stats),
-        ("top", cmd_top), ("grouptop", cmd_grouptop), ("language", cmd_language),
-        ("h2h", cmd_h2h), ("st", cmd_st),
-        ("xo", cmd_xo), ("pvp", cmd_pvp), ("pve", cmd_pve),
-        ("accept", cmd_accept), ("decline", cmd_decline),
-        ("quit", cmd_quit), ("board", cmd_board),
-        ("tournament", cmd_tournament), ("daily", cmd_daily),
-        ("coins", cmd_coins), ("bet", cmd_bet),
-        ("broadcast", cmd_broadcast), ("adminstats", cmd_admin_stats),
+        ("start",       cmd_start),
+        ("help",        cmd_help),
+        ("stats",       cmd_stats),
+        ("top",         cmd_top),
+        ("grouptop",    cmd_grouptop),
+        ("language",    cmd_language),
+        ("h2h",         cmd_h2h),
+        ("st",          cmd_st),
+        ("xo",          cmd_xo),
+        ("pvp",         cmd_pvp),
+        ("pve",         cmd_pve),
+        ("accept",      cmd_accept),
+        ("decline",     cmd_decline),
+        ("quit",        cmd_quit),
+        ("board",       cmd_board),
+        ("tournament",  cmd_tournament),
+        ("daily",       cmd_daily),
+        ("coins",       cmd_coins),
+        ("bet",         cmd_bet),
+        ("broadcast",   cmd_broadcast),
+        ("adminstats",  cmd_admin_stats),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
 
-    # Inline mode
+    # Inline mode handlers
     app.add_handler(InlineQueryHandler(handle_inline_query))
     app.add_handler(ChosenInlineResultHandler(handle_chosen_inline_result))
 
-    # Callbacks — ORDER MATTERS (most specific first)
+    # Callbacks — ORDER MATTERS
+    # 1. Inline game callbacks (im: ij: ix: ir: irem: in:)
     app.add_handler(CallbackQueryHandler(
         handle_inline_callbacks,
-        pattern=r"^(ij:|ix:|im:|ir:|irem:|in:)",
+        pattern=r"^(im:|ij:|ix:|ir:|irem:|in:)",
     ))
+    # 2. Regular game callbacks
     app.add_handler(CallbackQueryHandler(
         handle_game_callbacks,
         pattern=(
@@ -97,32 +124,49 @@ def build_app() -> Application:
             r"rematch:|revenge$|xo_join:|xo_cancel:|xo_new$|cb_pick_difficulty$)"
         ),
     ))
-    app.add_handler(CallbackQueryHandler(handle_tournament_callbacks, pattern=r"^t_"))
-    app.add_handler(CallbackQueryHandler(handle_daily_callback,       pattern=r"^daily:"))
-    app.add_handler(CallbackQueryHandler(handle_lang_callbacks,       pattern=r"^lang:"))
-    app.add_handler(CallbackQueryHandler(handle_menu_callbacks,       pattern=r"^cb_"))
+    # 3. Tournament
+    app.add_handler(CallbackQueryHandler(
+        handle_tournament_callbacks, pattern=r"^t_"
+    ))
+    # 4. Daily puzzle
+    app.add_handler(CallbackQueryHandler(
+        handle_daily_callback, pattern=r"^daily:"
+    ))
+    # 5. Language selection
+    app.add_handler(CallbackQueryHandler(
+        handle_lang_callbacks, pattern=r"^lang:"
+    ))
+    # 6. Menu navigation (broad cb_ — must be last)
+    app.add_handler(CallbackQueryHandler(
+        handle_menu_callbacks, pattern=r"^cb_"
+    ))
 
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_bot_added))
+    # Group join
+    app.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS, on_bot_added
+    ))
+
     return app
 
 def main():
-    app = build_app()
-    allowed = ["message","callback_query","inline_query","chosen_inline_result"]
+    app    = build_app()
+    upd    = ["message", "callback_query", "inline_query", "chosen_inline_result"]
     if USE_WEBHOOK:
         if not WEBHOOK_URL:
             logger.error("WEBHOOK_URL not set!")
             raise SystemExit(1)
         logger.info(f"Webhook mode — port {PORT}")
         app.run_webhook(
-            listen="0.0.0.0", port=PORT,
+            listen="0.0.0.0",
+            port=PORT,
             webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
             url_path=BOT_TOKEN,
             drop_pending_updates=True,
-            allowed_updates=allowed,
+            allowed_updates=upd,
         )
     else:
-        logger.info("Polling mode")
-        app.run_polling(drop_pending_updates=True, allowed_updates=allowed)
+        logger.info("Polling mode (local dev)")
+        app.run_polling(drop_pending_updates=True, allowed_updates=upd)
 
 if __name__ == "__main__":
     main()
