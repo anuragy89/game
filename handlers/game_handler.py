@@ -671,7 +671,7 @@ async def handle_game_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Board move ───────────────────────────────
     if data.startswith("mv:"):
         _, cid_s, idx_s = data.split(":")
-        await _handle_move(bot, int(cid_s), int(idx_s), user, lang, ctx)
+        await _handle_move(query, bot, int(cid_s), int(idx_s), user, lang, ctx)
         return
 
 
@@ -679,12 +679,11 @@ async def handle_game_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  MOVE HANDLER — send-new / delete-old approach
 # ─────────────────────────────────────────────────────────
 
-async def _handle_move(bot: Bot, cid: int, idx: int, user, lang: str, ctx):
+
+async def _handle_move(query, bot: Bot, cid: int, idx: int, user, lang: str, ctx):
     if cid not in games:
         return
-
     game = games[cid]
-
     if game["status"] != "playing":
         return
     if user.id not in game["players"]:
@@ -696,18 +695,17 @@ async def _handle_move(bot: Bot, cid: int, idx: int, user, lang: str, ctx):
     if board[idx] != EMPTY:
         return
 
-    # Place mark
     mark = game["players"][user.id]
     board[idx] = mark
     game["move_history"].append((board[:], mark, idx))
 
     winner = check_winner(board)
     if winner or is_draw(board):
-        await _end_game(bot, game, cid, winner, ctx)
+        await _end_game(query, bot, game, cid, winner, ctx)
         return
 
     if game["mode"] in ("pvp", "xo"):
-        # Switch turn
+        # ── PvP / xo: send new message + delete old ──
         all_pids     = list(game["players"].keys())
         game["turn"] = [p for p in all_pids if p != user.id][0]
         nxt_id       = game["turn"]
@@ -721,22 +719,24 @@ async def _handle_move(bot: Bot, cid: int, idx: int, user, lang: str, ctx):
         )
 
     else:
-        # PvE — show "thinking" then bot moves
+        # ── PvE: edit the same message every move ─────
         character    = game.get("character", DEFAULT_CHARACTER)
         game["turn"] = "bot"
 
-        # Send "thinking" board (no delete yet — keeps something visible)
-        think_msg = await bot.send_message(
-            cid,
-            f"{game_header(game)}\n\n"
-            f"{board_to_emoji(board)}\n\n"
-            f"{char_thinking(character)}",
-            reply_markup=board_kb(board, cid),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        # Delete the previous board message
-        await _delete_msg(bot, cid, game.get("msg_id"))
-        game["msg_id"] = think_msg.message_id
+        # Edit to "thinking" state
+        try:
+            await query.edit_message_text(
+                f"{game_header(game)}\n\n"
+                f"{board_to_emoji(board)}\n\n"
+                f"{char_thinking(character)}",
+                reply_markup=board_kb(board, cid),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                logger.warning(f"PvE thinking edit: {e}")
+        except TelegramError as e:
+            logger.warning(f"PvE thinking edit error: {e}")
 
         await asyncio.sleep(BOT_THINK_DELAY)
 
@@ -747,23 +747,34 @@ async def _handle_move(bot: Bot, cid: int, idx: int, user, lang: str, ctx):
 
         winner = check_winner(board)
         if winner or is_draw(board):
-            await _end_game(bot, game, cid, winner, ctx)
+            await _end_game(query, bot, game, cid, winner, ctx)
             return
 
         game["turn"] = user.id
-        await _send_board(
-            bot, game, cid,
-            f"{game_header(game)}\n\n"
-            f"{board_to_emoji(board)}\n\n"
-            f"{t('your_turn', lang)}",
-        )
+
+        # Edit to updated board + your turn
+        try:
+            await query.edit_message_text(
+                f"{game_header(game)}\n\n"
+                f"{board_to_emoji(board)}\n\n"
+                f"{t('your_turn', lang)}",
+                reply_markup=board_kb(board, cid),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                logger.warning(f"PvE your-turn edit: {e}")
+        except TelegramError as e:
+            logger.warning(f"PvE your-turn edit error: {e}")
 
 
 # ─────────────────────────────────────────────────────────
 #  END GAME
+#  PvE  → edit the existing board message
+#  PvP  → delete board message, send fresh result
 # ─────────────────────────────────────────────────────────
 
-async def _end_game(bot: Bot, game: dict, chat_id: int, winner_val, ctx):
+async def _end_game(query, bot: Bot, game: dict, chat_id: int, winner_val, ctx):
     board     = game["board"]
     mode      = game["mode"]
     is_tourn  = game.get("tournament", False)
@@ -773,11 +784,8 @@ async def _end_game(bot: Bot, game: dict, chat_id: int, winner_val, ctx):
     game["status"] = "over"
     games.pop(chat_id, None)
 
-    # Delete last board message
-    await _delete_msg(bot, chat_id, game.get("msg_id"))
-
-    header      = game_header(game)
     board_emoji = board_to_emoji(board)
+    header      = game_header(game)
 
     winner_id = loser_id = winner_name = None
     result_text = personality = ""
@@ -871,7 +879,7 @@ async def _end_game(bot: Bot, game: dict, chat_id: int, winner_val, ctx):
 
     final = f"{header}\n\n{result_text}\n\n{board_emoji}{extras}"
 
-    # Choose post-game keyboard
+    # Post-game keyboard
     if is_tourn:
         kb = None
     elif mode == "pve" and winner_id == "bot" and game.get("difficulty") == "hard":
@@ -881,11 +889,32 @@ async def _end_game(bot: Bot, game: dict, chat_id: int, winner_val, ctx):
     else:
         kb = rematch_kb(mode)
 
-    await bot.send_message(
-        chat_id, final,
-        reply_markup=kb,
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    if mode == "pve":
+        # ── PvE: edit the existing board message ──────
+        try:
+            await query.edit_message_text(
+                final,
+                reply_markup=kb,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                # Fallback: send as new message
+                logger.warning(f"PvE end edit failed ({e}), sending new message")
+                await bot.send_message(chat_id, final, reply_markup=kb,
+                                       parse_mode=ParseMode.MARKDOWN)
+        except TelegramError as e:
+            logger.warning(f"PvE end TelegramError ({e}), sending new message")
+            await bot.send_message(chat_id, final, reply_markup=kb,
+                                   parse_mode=ParseMode.MARKDOWN)
+    else:
+        # ── PvP / xo: delete board, send fresh result ─
+        await _delete_msg(bot, chat_id, game.get("msg_id"))
+        await bot.send_message(
+            chat_id, final,
+            reply_markup=kb,
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
     if is_tourn and ctx and winner_id and winner_id != "bot":
         from handlers.tournament_handler import record_tournament_result
