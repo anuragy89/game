@@ -1,28 +1,31 @@
 """
-handlers/inline_handler.py — Complete inline-mode bot.
+handlers/inline_handler.py
 
-How it works:
-  User types @BotName anywhere → 4 game options appear
-  User picks one → game board posted to that chat
-  All moves use inline_message_id (iid) as the unique game key
-  bot.edit_message_text(inline_message_id=iid) updates the board
+REQUIRED BotFather setup (do this first!):
+  1. /setinline    → @YourBot → any placeholder text e.g.  Play XO
+  2. /setinlinefeedback → @YourBot → 100%
+     WITHOUT step 2, inline_message_id is always None and games never start.
 
-The stuck/freeze fix (same root cause as regular mode):
-  1. asyncio.Lock per game — serialises concurrent PvP taps, zero races
-  2. ParseMode.HTML + html.escape() on every name — never breaks
-  3. RetryAfter caught and retried — flood control handled properly
-  4. answer_callback_query() called FIRST before any work
+How inline mode works:
+  User types @BotName in any chat → picks a game type → message posted
+  Telegram fires ChosenInlineResultHandler → we get inline_message_id
+  We use that id to edit the message with the board
 
-BotFather setup (required):
-  /setinline @YourBot → set placeholder text e.g. "Play XO"
-  /setinlinefeedback @YourBot → 100%   (needed for ChosenInlineResultHandler)
+Race condition fix:
+  Telegram needs ~500ms to register the inline message before we can edit it
+  We sleep 0.5s in handle_chosen_inline_result before the first edit
+
+Race condition fix #2 (PvP stuck):
+  asyncio.Lock per game — both players can tap simultaneously without corrupting state
+
+Error fix:
+  All text uses ParseMode.HTML + html.escape() — never breaks on any name
 """
 
 import asyncio
 import html
 import logging
 import re
-import time
 
 from telegram import (
     Update,
@@ -42,7 +45,7 @@ from game import (
     EMPTY, CELL_EMOJI, X, O, CHARACTERS, DEFAULT_CHARACTER,
 )
 from database import (
-    save_user, get_user, update_user_stats_full, update_group_stats,
+    save_user, get_user, update_user_stats_full,
     update_h2h, STARTING_ELO, COINS_WIN, COINS_DRAW,
 )
 from config import BOT_THINK_DELAY
@@ -50,29 +53,21 @@ from config import BOT_THINK_DELAY
 logger = logging.getLogger(__name__)
 
 # ── State ──────────────────────────────────────────────────
-# Key: inline_message_id (str) — globally unique per inline message
-inline_games: dict = {}
+inline_games: dict = {}   # iid → game dict
 inline_locks: dict = {}   # iid → asyncio.Lock
 
 
 # ─────────────────────────────────────────────────────────
-#  HTML HELPERS
+#  HELPERS
 # ─────────────────────────────────────────────────────────
 
 def e(s) -> str:
+    """Escape for HTML parse mode."""
     return html.escape(str(s), quote=False)
 
-def b(s) -> str:
-    return f"<b>{e(s)}</b>"
-
 def strip_md(s: str) -> str:
-    """Remove markdown markers so strings are safe for HTML mode."""
+    """Remove markdown markers so text is safe for HTML mode."""
     return re.sub(r"[*_`\[\]]", "", str(s))
-
-
-# ─────────────────────────────────────────────────────────
-#  LOCK HELPERS
-# ─────────────────────────────────────────────────────────
 
 def _get_lock(iid: str) -> asyncio.Lock:
     if iid not in inline_locks:
@@ -82,27 +77,29 @@ def _get_lock(iid: str) -> asyncio.Lock:
 def _drop_lock(iid: str):
     inline_locks.pop(iid, None)
 
+async def _lang(uid: int) -> str:
+    doc = await get_user(uid)
+    return (doc or {}).get("lang", "en")
+
 
 # ─────────────────────────────────────────────────────────
-#  KEYBOARD BUILDERS
+#  KEYBOARDS
 # ─────────────────────────────────────────────────────────
 
-def _b(text: str, data: str, style: str = "") -> InlineKeyboardButton:
+def _b(text, data, style=""):
     if style:
         return InlineKeyboardButton(
             text, callback_data=data, api_kwargs={"style": style}
         )
     return InlineKeyboardButton(text, callback_data=data)
 
-
-def _join_kb(iid: str) -> InlineKeyboardMarkup:
+def _join_kb(iid):
     return InlineKeyboardMarkup([[
         _b("⚡ Join Game", f"ij:{iid}", "success"),
         _b("Cancel",      f"ix:{iid}", "danger"),
     ]])
 
-
-def _board_kb(board: list, iid: str) -> InlineKeyboardMarkup:
+def _board_kb(board, iid):
     rows = []
     for r in range(3):
         row = []
@@ -120,8 +117,7 @@ def _board_kb(board: list, iid: str) -> InlineKeyboardMarkup:
         rows.append(row)
     return InlineKeyboardMarkup(rows)
 
-
-def _end_kb(iid: str, mode: str, show_revenge: bool = False) -> InlineKeyboardMarkup:
+def _end_kb(iid, mode, show_revenge=False):
     if show_revenge:
         return InlineKeyboardMarkup([
             [_b("🔥 REVENGE  ×2 Coins", f"ir:{iid}",   "danger")],
@@ -139,10 +135,10 @@ def _end_kb(iid: str, mode: str, show_revenge: bool = False) -> InlineKeyboardMa
 
 
 # ─────────────────────────────────────────────────────────
-#  DISPLAY HELPERS
+#  DISPLAY
 # ─────────────────────────────────────────────────────────
 
-def _header(game: dict) -> str:
+def _header(game):
     if game["mode"] in ("pvp", "xo"):
         xn = e(game["names"].get(game["x_player"], "Player 1"))
         on = e(game["names"].get(game["o_player"], "Player 2"))
@@ -153,16 +149,16 @@ def _header(game: dict) -> str:
     diff  = e(game.get("difficulty", "hard").capitalize())
     return f"❌ <b>{xn}</b>  ⚔️  {cname} <b>[{diff}]</b>"
 
-def _tmark(game: dict, uid) -> str:
+def _tmark(game, uid):
     return "❌" if game["players"].get(uid) == X else "⭕"
 
 
 # ─────────────────────────────────────────────────────────
-#  SAFE EDIT  — full error handling, never raises
+#  SAFE EDIT  — never raises, retries on flood
 # ─────────────────────────────────────────────────────────
 
 async def _edit(bot, iid: str, text: str, markup=None):
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             await bot.edit_message_text(
                 text,
@@ -170,36 +166,37 @@ async def _edit(bot, iid: str, text: str, markup=None):
                 reply_markup=markup,
                 parse_mode=ParseMode.HTML,
             )
+            logger.debug(f"_edit ok iid={iid[:8]}")
             return
         except RetryAfter as ex:
-            if attempt == 0:
-                await asyncio.sleep(ex.retry_after + 1)
-            else:
-                logger.warning(f"RetryAfter twice on {iid}: {ex}")
-                return
+            wait = ex.retry_after + 1
+            logger.warning(f"_edit RetryAfter {wait}s iid={iid[:8]}")
+            await asyncio.sleep(wait)
         except BadRequest as ex:
             msg = str(ex).lower()
-            if "not modified" in msg or "message to edit not found" in msg:
+            if "not modified" in msg:
+                return   # already correct
+            if "message to edit not found" in msg:
+                logger.warning(f"_edit: message not found yet iid={iid[:8]}, retry {attempt}")
+                if attempt < 2:
+                    await asyncio.sleep(1.0)   # wait and retry
+                    continue
                 return
-            logger.warning(f"_edit BadRequest {iid}: {ex}")
+            logger.error(f"_edit BadRequest iid={iid[:8]}: {ex}")
             return
         except TelegramError as ex:
-            logger.warning(f"_edit TelegramError {iid}: {ex}")
+            logger.error(f"_edit TelegramError iid={iid[:8]}: {ex}")
             return
-
-
-async def _get_lang(user_id: int) -> str:
-    doc = await get_user(user_id)
-    return (doc or {}).get("lang", "en")
 
 
 # ─────────────────────────────────────────────────────────
-#  INLINE QUERY  — shows 4 game options when user types @BotName
+#  INLINE QUERY  — fires when user types @BotName
 # ─────────────────────────────────────────────────────────
 
 async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.inline_query
     await save_user(query.from_user)
+    logger.info(f"inline_query from {query.from_user.id}")
 
     results = [
         InlineQueryResultArticle(
@@ -212,8 +209,8 @@ async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ),
         InlineQueryResultArticle(
             id="pve_hard",
-            title="🤖 vs Bot — Hard (unbeatable)",
-            description="Minimax AI — Hard difficulty",
+            title="🤖 vs Bot — Hard",
+            description="Unbeatable Minimax AI",
             input_message_content=InputTextMessageContent(
                 "🎮 <b>Setting up game…</b>", parse_mode=ParseMode.HTML,
             ),
@@ -221,7 +218,7 @@ async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         InlineQueryResultArticle(
             id="pve_medium",
             title="🤖 vs Bot — Medium",
-            description="AI — Medium difficulty",
+            description="Medium difficulty AI",
             input_message_content=InputTextMessageContent(
                 "🎮 <b>Setting up game…</b>", parse_mode=ParseMode.HTML,
             ),
@@ -229,7 +226,7 @@ async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         InlineQueryResultArticle(
             id="pve_easy",
             title="🤖 vs Bot — Easy",
-            description="AI — Easy difficulty",
+            description="Easy difficulty AI",
             input_message_content=InputTextMessageContent(
                 "🎮 <b>Setting up game…</b>", parse_mode=ParseMode.HTML,
             ),
@@ -239,8 +236,8 @@ async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────
-#  CHOSEN INLINE RESULT  — fires once after user picks a result
-#  This gives us the iid to key the game on
+#  CHOSEN INLINE RESULT
+#  Fires ONLY if /setinlinefeedback is set to 100% in BotFather
 # ─────────────────────────────────────────────────────────
 
 async def handle_chosen_inline_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -249,13 +246,22 @@ async def handle_chosen_inline_result(update: Update, ctx: ContextTypes.DEFAULT_
     user      = result.from_user
     result_id = result.result_id
 
+    logger.info(f"chosen_inline_result: user={user.id} result_id={result_id} iid={iid}")
+
     if not iid:
+        # This means /setinlinefeedback is NOT set to 100% in BotFather
+        logger.error(
+            "inline_message_id is None! "
+            "Go to BotFather → /setinlinefeedback → @YourBot → 100%"
+        )
         return
 
     await save_user(user)
 
+    # Wait for Telegram to register the message before we try to edit it
+    await asyncio.sleep(0.5)
+
     if result_id == "pvp_open":
-        # Open lobby — wait for someone to join
         inline_games[iid] = {
             "mode":    "pvp_lobby",
             "creator": user,
@@ -271,12 +277,12 @@ async def handle_chosen_inline_result(update: Update, ctx: ContextTypes.DEFAULT_
         )
 
     elif result_id.startswith("pve_"):
-        diff  = result_id.split("_")[1]          # easy / medium / hard
-        char  = DEFAULT_CHARACTER
-        game  = new_pve_game(user.id, user.full_name, diff, char)
+        diff = result_id.split("_")[1]
+        char = DEFAULT_CHARACTER
+        game = new_pve_game(user.id, user.full_name, diff, char)
         game["iid"] = iid
-        inline_games[iid]  = game
-        inline_locks[iid]  = asyncio.Lock()
+        inline_games[iid] = game
+        inline_locks[iid] = asyncio.Lock()
 
         char_data  = CHARACTERS[char]
         char_intro = e(strip_md(char_data["intro"]))
@@ -290,9 +296,11 @@ async def handle_chosen_inline_result(update: Update, ctx: ContextTypes.DEFAULT_
             markup=_board_kb(game["board"], iid),
         )
 
+    logger.info(f"game initialised iid={iid[:8]} result_id={result_id}")
+
 
 # ─────────────────────────────────────────────────────────
-#  INLINE CALLBACKS
+#  CALLBACK ROUTER
 # ─────────────────────────────────────────────────────────
 
 async def handle_inline_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -301,7 +309,6 @@ async def handle_inline_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     user  = query.from_user
     bot   = ctx.bot
 
-    # Answer IMMEDIATELY — clears Telegram's loading spinner
     try:
         await query.answer()
     except TelegramError:
@@ -314,13 +321,14 @@ async def handle_inline_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             pass
         return
 
-    # ── Join open lobby ──────────────────────────
+    # ── Join lobby ───────────────────────────────
     if data.startswith("ij:"):
         iid   = data[3:]
         entry = inline_games.get(iid)
 
         if not entry:
-            await _edit(bot, iid, "❌ This lobby has expired. Start a new game with @BotName")
+            await _edit(bot, iid,
+                "❌ This lobby expired.\n\nType @BotName to start a new game.")
             return
         if entry.get("mode") != "pvp_lobby":
             try: await query.answer("Game already started!", show_alert=True)
@@ -349,7 +357,7 @@ async def handle_inline_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # ── Cancel lobby ────────────────────────────
+    # ── Cancel lobby ─────────────────────────────
     if data.startswith("ix:"):
         iid   = data[3:]
         entry = inline_games.get(iid)
@@ -363,7 +371,7 @@ async def handle_inline_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         await _edit(bot, iid, "❌ Game cancelled.")
         return
 
-    # ── Board move — runs under lock ─────────────
+    # ── Board move ────────────────────────────────
     if data.startswith("im:"):
         parts = data.split(":")
         iid   = parts[1]
@@ -372,12 +380,12 @@ async def handle_inline_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             await _do_move(bot, iid, idx, user)
         return
 
-    # ── Rematch ──────────────────────────────────
+    # ── Rematch ───────────────────────────────────
     if data.startswith("irem:"):
         iid      = data[5:]
         old_game = inline_games.get(iid)
         if not old_game or old_game.get("mode") != "pve":
-            try: await query.answer("Rematch only available for PvE games.", show_alert=True)
+            try: await query.answer("Rematch only for PvE games.", show_alert=True)
             except TelegramError: pass
             return
         if user.id != old_game["x_player"]:
@@ -386,9 +394,9 @@ async def handle_inline_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             return
 
         await save_user(user)
-        diff  = old_game.get("difficulty", "hard")
-        char  = old_game.get("character",  DEFAULT_CHARACTER)
-        game  = new_pve_game(user.id, user.full_name, diff, char)
+        diff = old_game.get("difficulty", "hard")
+        char = old_game.get("character",  DEFAULT_CHARACTER)
+        game = new_pve_game(user.id, user.full_name, diff, char)
         game["iid"] = iid
         inline_games[iid] = game
         inline_locks[iid] = asyncio.Lock()
@@ -406,7 +414,7 @@ async def handle_inline_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # ── Revenge ──────────────────────────────────
+    # ── Revenge ───────────────────────────────────
     if data.startswith("ir:"):
         iid      = data[3:]
         old_game = inline_games.get(iid)
@@ -433,7 +441,7 @@ async def handle_inline_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # ── New open game ────────────────────────────
+    # ── New open game ─────────────────────────────
     if data.startswith("in:"):
         iid = data[3:]
         inline_games.pop(iid, None)
@@ -456,7 +464,7 @@ async def handle_inline_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
 
 # ─────────────────────────────────────────────────────────
-#  MOVE HANDLER  — always runs under per-game lock
+#  MOVE HANDLER  — runs under per-game lock
 # ─────────────────────────────────────────────────────────
 
 async def _do_move(bot, iid: str, idx: int, user):
@@ -467,11 +475,11 @@ async def _do_move(bot, iid: str, idx: int, user):
         return
     if user.id != game["turn"]:
         return
+
     board = game["board"]
     if board[idx] != EMPTY:
         return
 
-    # Place mark
     mark = game["players"][user.id]
     board[idx] = mark
     game["move_history"].append((board[:], mark, idx))
@@ -482,7 +490,6 @@ async def _do_move(bot, iid: str, idx: int, user):
         return
 
     if game["mode"] in ("pvp", "xo"):
-        # Switch turn
         all_pids     = list(game["players"].keys())
         game["turn"] = [p for p in all_pids if p != user.id][0]
         nxt_id       = game["turn"]
@@ -497,15 +504,14 @@ async def _do_move(bot, iid: str, idx: int, user):
         )
 
     else:
-        # PvE — show thinking, wait, bot moves
         char         = game.get("character", DEFAULT_CHARACTER)
         game["turn"] = "bot"
-        think_text   = e(strip_md(char_thinking(char)))
+        think        = e(strip_md(char_thinking(char)))
         await _edit(
             bot, iid,
             f"{_header(game)}\n\n"
             f"{board_to_emoji(board)}\n\n"
-            f"{think_text}",
+            f"{think}",
             markup=_board_kb(board, iid),
         )
 
@@ -532,7 +538,7 @@ async def _do_move(bot, iid: str, idx: int, user):
 
 
 # ─────────────────────────────────────────────────────────
-#  END GAME  — result ALWAYS shown
+#  END GAME
 # ─────────────────────────────────────────────────────────
 
 async def _end(bot, iid: str, game: dict, winner_val):
@@ -543,7 +549,6 @@ async def _end(bot, iid: str, game: dict, winner_val):
 
     game["status"] = "over"
     _drop_lock(iid)
-    # Keep game in inline_games for rematch/revenge callbacks
 
     header      = _header(game)
     board_emoji = board_to_emoji(board)
@@ -565,7 +570,6 @@ async def _end(bot, iid: str, game: dict, winner_val):
             raw = char_result_msg(character, "draw")
             personality_html = f"\n\n<i>{e(strip_md(raw.strip()))}</i>"
 
-    # Stats / ELO
     x_id   = game["x_player"]
     o_id   = game["o_player"]
     x_name = game["names"].get(x_id, "Player")
@@ -576,8 +580,7 @@ async def _end(bot, iid: str, game: dict, winner_val):
     x_elo  = (x_doc or {}).get("elo", STARTING_ELO)
     o_elo  = (o_doc or {}).get("elo", STARTING_ELO)
 
-    elo_lines    = []
-    streak_lines = []
+    elo_lines = []
 
     async def _proc(uid, result, opp_elo, name):
         if not uid or uid == "bot":
@@ -590,11 +593,6 @@ async def _end(bot, iid: str, game: dict, winner_val):
             f"📈 <b>{e(name)}</b> ELO: {delta['old_elo']} → "
             f"{delta['new_elo']} ({sign}{delta['elo_delta']})"
         )
-        s, p = delta["streak"], delta["prev_streak"]
-        if result == "win" and s in (3, 5, 10, 20) and s > p:
-            streak_lines.append(f"🔥 <b>{e(name)}</b> is on a <b>{s}-win streak!</b>")
-        elif result != "win" and p >= 3:
-            streak_lines.append(f"💔 <b>{e(name)}</b>'s {p}-win streak is over!")
 
     if winner_val:
         if winner_id == x_id:
@@ -612,7 +610,6 @@ async def _end(bot, iid: str, game: dict, winner_val):
             and loser_id  and loser_id  != "bot"):
         await update_h2h(winner_id, loser_id)
 
-    # Coins
     coins_html = ""
     if is_rev and winner_id and winner_id != "bot":
         coins_html = (
@@ -622,28 +619,23 @@ async def _end(bot, iid: str, game: dict, winner_val):
         from database import add_coins as _ac
         await _ac(winner_id, COINS_WIN)
     elif winner_id and winner_id != "bot":
-        coins_html = (
-            f"\n💰 <b>{e(winner_name)}</b> earned <b>+{COINS_WIN} coins!</b>"
-        )
+        coins_html = f"\n💰 <b>{e(winner_name)}</b> earned <b>+{COINS_WIN} coins!</b>"
     elif not winner_val:
         coins_html = f"\n💰 Both players earned <b>+{COINS_DRAW} coins!</b>"
 
-    # Analysis
     analysis_html = ""
     raw_a = analyse_game(game.get("move_history", []))
     if raw_a:
         analysis_html = f"\n\n{e(strip_md(raw_a))}"
 
-    # Assemble
     extras = ""
-    if elo_lines:       extras += "\n\n" + "\n".join(elo_lines)
-    if streak_lines:    extras += "\n\n" + "\n".join(streak_lines)
-    if coins_html:      extras += coins_html
+    if elo_lines:        extras += "\n\n" + "\n".join(elo_lines)
+    if coins_html:       extras += coins_html
     if personality_html: extras += personality_html
-    if analysis_html:   extras += analysis_html
+    if analysis_html:    extras += analysis_html
 
-    divider = "\n\n" + "─" * 14 + "\n\n" if extras else "\n\n"
-    final = f"{header}\n\n{result_text}\n\n{board_emoji}{divider}{extras.strip()}"
+    sep   = "\n\n" + "─" * 14 if extras else ""
+    final = f"{header}\n\n{result_text}\n\n{board_emoji}{sep}\n\n{extras.strip()}"
 
     show_revenge = (
         mode == "pve"
