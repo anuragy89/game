@@ -1,20 +1,23 @@
 """
-bot.py – Main entry point. All handlers registered here.
+bot.py – Entry point. All handlers registered here.
 
-Callback routing (mutually exclusive prefixes):
-  noop          → game_handler
-  mv:           → game_handler  (board move)
-  ch_accept:    → game_handler  (accept challenge button)
-  ch_decline:   → game_handler  (decline challenge button)
-  diff:         → game_handler  (difficulty pick)
-  char:         → game_handler  (character pick)
-  rematch:      → game_handler  (rematch)
-  revenge       → game_handler  (revenge mode)
-  cb_pick_difficulty → game_handler (back to diff picker)
-  t_            → tournament_handler
-  daily:        → daily_handler
-  lang:         → user_handler
-  cb_           → user_handler  (menu nav)
+Callback routing (mutually exclusive, ordered by specificity):
+  noop                → game_handler
+  mv:                 → game_handler  (board move)
+  ch_accept:          → game_handler
+  ch_decline:         → game_handler
+  diff:               → game_handler  (difficulty)
+  char:               → game_handler  (character)
+  rematch:            → game_handler
+  revenge             → game_handler
+  xo_join:            → game_handler  (open lobby join)
+  xo_cancel:          → game_handler  (open lobby cancel)
+  xo_new              → game_handler  (post-game new open lobby)
+  cb_pick_difficulty  → game_handler  (back button in char picker)
+  t_                  → tournament_handler
+  daily:              → daily_handler
+  lang:               → user_handler
+  cb_                 → user_handler  (menu nav)
 """
 
 import logging
@@ -34,7 +37,7 @@ from handlers.user_handler import (
     on_bot_added,
 )
 from handlers.game_handler import (
-    cmd_pvp, cmd_pve, cmd_accept, cmd_decline, cmd_quit, cmd_board,
+    cmd_pvp, cmd_xo, cmd_pve, cmd_accept, cmd_decline, cmd_quit, cmd_board,
     handle_game_callbacks,
 )
 from handlers.admin_handler      import cmd_broadcast, cmd_admin_stats
@@ -50,12 +53,13 @@ logger = logging.getLogger(__name__)
 
 COMMANDS = [
     BotCommand("start",       "🏠 Start / main menu"),
-    BotCommand("pvp",         "⚔️ Challenge a player"),
+    BotCommand("xo",          "🎮 Open lobby — anyone can join"),
+    BotCommand("pvp",         "⚔️ Challenge a specific player"),
     BotCommand("pve",         "🤖 Play vs AI bot"),
-    BotCommand("accept",      "Accept a challenge"),
+    BotCommand("accept",      "Accept a @username challenge"),
     BotCommand("decline",     "Decline a challenge"),
     BotCommand("board",       "Show current board"),
-    BotCommand("quit",        "Quit current game"),
+    BotCommand("quit",        "Quit / cancel game"),
     BotCommand("tournament",  "🏆 Start/join a tournament"),
     BotCommand("daily",       "📅 Daily puzzle (+coins)"),
     BotCommand("coins",       "💰 Your coin balance"),
@@ -63,7 +67,7 @@ COMMANDS = [
     BotCommand("stats",       "📊 Your stats & ELO"),
     BotCommand("top",         "🌍 Global leaderboard"),
     BotCommand("grouptop",    "Group leaderboard"),
-    BotCommand("h2h",         "📊 Head-to-head vs a player"),
+    BotCommand("h2h",         "Head-to-head record vs a player"),
     BotCommand("language",    "🌐 Change language"),
     BotCommand("help",        "Help & all commands"),
 ]
@@ -84,7 +88,7 @@ def build_app() -> Application:
         .build()
     )
 
-    # User
+    # ── User commands ──────────────────────────────────────
     app.add_handler(CommandHandler("start",      cmd_start))
     app.add_handler(CommandHandler("help",       cmd_help))
     app.add_handler(CommandHandler("stats",      cmd_stats))
@@ -94,7 +98,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("h2h",        cmd_h2h))
     app.add_handler(CommandHandler("st",         cmd_st))
 
-    # Game
+    # ── Game commands ──────────────────────────────────────
+    app.add_handler(CommandHandler("xo",         cmd_xo))
     app.add_handler(CommandHandler("pvp",        cmd_pvp))
     app.add_handler(CommandHandler("pve",        cmd_pve))
     app.add_handler(CommandHandler("accept",     cmd_accept))
@@ -102,7 +107,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("quit",       cmd_quit))
     app.add_handler(CommandHandler("board",      cmd_board))
 
-    # Tournament / Economy / Admin
+    # ── Tournament / Economy / Admin ───────────────────────
     app.add_handler(CommandHandler("tournament", cmd_tournament))
     app.add_handler(CommandHandler("daily",      cmd_daily))
     app.add_handler(CommandHandler("coins",      cmd_coins))
@@ -111,10 +116,25 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("adminstats", cmd_admin_stats))
 
     # ── Callbacks — ORDER MATTERS ──────────────────────────
-    # 1. Game callbacks (board moves, challenge, diff, character, rematch, revenge)
+    # 1. Game: board, challenge, diff, char, rematch, revenge, xo lobby
     app.add_handler(CallbackQueryHandler(
         handle_game_callbacks,
-        pattern=r"^(noop$|mv:|ch_accept:|ch_decline:|diff:|char:|rematch:|revenge$|cb_pick_difficulty$)",
+        pattern=(
+            r"^("
+            r"noop$"
+            r"|mv:"
+            r"|ch_accept:"
+            r"|ch_decline:"
+            r"|diff:"
+            r"|char:"
+            r"|rematch:"
+            r"|revenge$"
+            r"|xo_join:"
+            r"|xo_cancel:"
+            r"|xo_new$"
+            r"|cb_pick_difficulty$"
+            r")"
+        ),
     ))
     # 2. Tournament
     app.add_handler(CallbackQueryHandler(handle_tournament_callbacks, pattern=r"^t_"))
@@ -122,10 +142,10 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(handle_daily_callback,       pattern=r"^daily:"))
     # 4. Language
     app.add_handler(CallbackQueryHandler(handle_lang_callbacks,       pattern=r"^lang:"))
-    # 5. Menu nav
+    # 5. Menu nav (must be last – broad cb_ pattern)
     app.add_handler(CallbackQueryHandler(handle_menu_callbacks,       pattern=r"^cb_"))
 
-    # Group join
+    # ── Group join event ───────────────────────────────────
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_bot_added))
 
     return app
@@ -135,9 +155,9 @@ def main() -> None:
     app = build_app()
     if USE_WEBHOOK:
         if not WEBHOOK_URL:
-            logger.error("WEBHOOK_URL not set! Run: heroku config:set WEBHOOK_URL=https://YOUR-APP.herokuapp.com")
+            logger.error("WEBHOOK_URL not set!")
             raise SystemExit(1)
-        logger.info(f"Webhook mode — port {PORT}  url {WEBHOOK_URL}")
+        logger.info(f"Webhook mode — port {PORT}")
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
