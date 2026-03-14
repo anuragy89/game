@@ -1,30 +1,41 @@
 """
-bot.py – Entry point. All handlers registered here.
+bot.py – Entry point. Registers all handlers.
 
-Callback routing (mutually exclusive, ordered by specificity):
-  noop                → game_handler
-  mv:                 → game_handler  (board move)
-  ch_accept:          → game_handler
-  ch_decline:         → game_handler
-  diff:               → game_handler  (difficulty)
-  char:               → game_handler  (character)
-  rematch:            → game_handler
-  revenge             → game_handler
-  xo_join:            → game_handler  (open lobby join)
-  xo_cancel:          → game_handler  (open lobby cancel)
-  xo_new              → game_handler  (post-game new open lobby)
-  cb_pick_difficulty  → game_handler  (back button in char picker)
-  t_                  → tournament_handler
-  daily:              → daily_handler
-  lang:               → user_handler
-  cb_                 → user_handler  (menu nav)
+Callback routing (inline game callbacks use i-prefix, regular use existing):
+  noop              → game_handler / inline (both handle it)
+  im:               → inline_handler  (inline board move)
+  ij:               → inline_handler  (inline join lobby)
+  ix:               → inline_handler  (inline cancel lobby)
+  ir:               → inline_handler  (inline revenge)
+  irem:             → inline_handler  (inline rematch)
+  in:               → inline_handler  (inline new game)
+  mv:               → game_handler    (regular board move)
+  ch_accept:        → game_handler
+  ch_decline:       → game_handler
+  diff:             → game_handler
+  char:             → game_handler
+  rematch:          → game_handler
+  revenge           → game_handler
+  xo_join:          → game_handler
+  xo_cancel:        → game_handler
+  xo_new            → game_handler
+  cb_pick_difficulty→ game_handler
+  t_                → tournament_handler
+  daily:            → daily_handler
+  lang:             → user_handler
+  cb_               → user_handler
+
+Enable inline mode in BotFather:
+  /setinline → @YourBot → "Play XO"   (placeholder text)
+  /setinlinefeedback → @YourBot → 100%  (needed for ChosenInlineResultHandler)
 """
 
 import logging
 from telegram import BotCommand
 from telegram.ext import (
-    Application, CommandHandler,
-    CallbackQueryHandler, MessageHandler, filters,
+    Application, CommandHandler, CallbackQueryHandler,
+    InlineQueryHandler, ChosenInlineResultHandler,
+    MessageHandler, filters,
 )
 
 from config import BOT_TOKEN, PORT, WEBHOOK_URL, USE_WEBHOOK
@@ -39,6 +50,10 @@ from handlers.user_handler import (
 from handlers.game_handler import (
     cmd_pvp, cmd_xo, cmd_pve, cmd_accept, cmd_decline, cmd_quit, cmd_board,
     handle_game_callbacks,
+)
+from handlers.inline_handler import (
+    handle_inline_query, handle_chosen_inline_result,
+    handle_inline_callbacks,
 )
 from handlers.admin_handler      import cmd_broadcast, cmd_admin_stats
 from handlers.daily_handler      import cmd_daily, handle_daily_callback
@@ -56,20 +71,20 @@ COMMANDS = [
     BotCommand("xo",          "🎮 Open lobby — anyone can join"),
     BotCommand("pvp",         "⚔️ Challenge a specific player"),
     BotCommand("pve",         "🤖 Play vs AI bot"),
-    BotCommand("accept",      "Accept a @username challenge"),
+    BotCommand("accept",      "Accept a challenge"),
     BotCommand("decline",     "Decline a challenge"),
     BotCommand("board",       "Show current board"),
     BotCommand("quit",        "Quit / cancel game"),
-    BotCommand("tournament",  "🏆 Start/join a tournament"),
+    BotCommand("tournament",  "🏆 Tournament bracket"),
     BotCommand("daily",       "📅 Daily puzzle (+coins)"),
-    BotCommand("coins",       "💰 Your coin balance"),
+    BotCommand("coins",       "💰 Coin balance"),
     BotCommand("bet",         "Bet coins before a game"),
-    BotCommand("stats",       "📊 Your stats & ELO"),
+    BotCommand("stats",       "📊 Stats & ELO"),
     BotCommand("top",         "🌍 Global leaderboard"),
     BotCommand("grouptop",    "Group leaderboard"),
-    BotCommand("h2h",         "Head-to-head record vs a player"),
+    BotCommand("h2h",         "Head-to-head record"),
     BotCommand("language",    "🌐 Change language"),
-    BotCommand("help",        "Help & all commands"),
+    BotCommand("help",        "Help & commands"),
 ]
 
 
@@ -77,7 +92,7 @@ async def post_init(app: Application) -> None:
     await ensure_indexes()
     await app.bot.set_my_commands(COMMANDS)
     info = await app.bot.get_me()
-    logger.info(f"Bot @{info.username} ready.")
+    logger.info(f"Bot @{info.username} ready. Inline mode: enabled.")
 
 
 def build_app() -> Application:
@@ -88,7 +103,7 @@ def build_app() -> Application:
         .build()
     )
 
-    # ── User commands ──────────────────────────────────────
+    # ── Commands ───────────────────────────────────────────
     app.add_handler(CommandHandler("start",      cmd_start))
     app.add_handler(CommandHandler("help",       cmd_help))
     app.add_handler(CommandHandler("stats",      cmd_stats))
@@ -97,8 +112,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("language",   cmd_language))
     app.add_handler(CommandHandler("h2h",        cmd_h2h))
     app.add_handler(CommandHandler("st",         cmd_st))
-
-    # ── Game commands ──────────────────────────────────────
     app.add_handler(CommandHandler("xo",         cmd_xo))
     app.add_handler(CommandHandler("pvp",        cmd_pvp))
     app.add_handler(CommandHandler("pve",        cmd_pve))
@@ -106,8 +119,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("decline",    cmd_decline))
     app.add_handler(CommandHandler("quit",       cmd_quit))
     app.add_handler(CommandHandler("board",      cmd_board))
-
-    # ── Tournament / Economy / Admin ───────────────────────
     app.add_handler(CommandHandler("tournament", cmd_tournament))
     app.add_handler(CommandHandler("daily",      cmd_daily))
     app.add_handler(CommandHandler("coins",      cmd_coins))
@@ -115,8 +126,18 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("broadcast",  cmd_broadcast))
     app.add_handler(CommandHandler("adminstats", cmd_admin_stats))
 
+    # ── Inline mode ────────────────────────────────────────
+    app.add_handler(InlineQueryHandler(handle_inline_query))
+    app.add_handler(ChosenInlineResultHandler(handle_chosen_inline_result))
+
     # ── Callbacks — ORDER MATTERS ──────────────────────────
-    # 1. Game: board, challenge, diff, char, rematch, revenge, xo lobby
+    # Inline game callbacks (i-prefixed) — first priority
+    app.add_handler(CallbackQueryHandler(
+        handle_inline_callbacks,
+        pattern=r"^(ij:|ix:|im:|ir:|irem:|in:)",
+    ))
+
+    # Regular game callbacks
     app.add_handler(CallbackQueryHandler(
         handle_game_callbacks,
         pattern=(
@@ -136,13 +157,10 @@ def build_app() -> Application:
             r")"
         ),
     ))
-    # 2. Tournament
+
     app.add_handler(CallbackQueryHandler(handle_tournament_callbacks, pattern=r"^t_"))
-    # 3. Daily puzzle
     app.add_handler(CallbackQueryHandler(handle_daily_callback,       pattern=r"^daily:"))
-    # 4. Language
     app.add_handler(CallbackQueryHandler(handle_lang_callbacks,       pattern=r"^lang:"))
-    # 5. Menu nav (must be last – broad cb_ pattern)
     app.add_handler(CallbackQueryHandler(handle_menu_callbacks,       pattern=r"^cb_"))
 
     # ── Group join event ───────────────────────────────────
@@ -164,10 +182,16 @@ def main() -> None:
             webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
             url_path=BOT_TOKEN,
             drop_pending_updates=True,
+            allowed_updates=["message", "callback_query",
+                             "inline_query", "chosen_inline_result"],
         )
     else:
         logger.info("Polling mode (local dev)")
-        app.run_polling(drop_pending_updates=True)
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=["message", "callback_query",
+                             "inline_query", "chosen_inline_result"],
+        )
 
 
 if __name__ == "__main__":
