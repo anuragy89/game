@@ -1,11 +1,11 @@
 """
-keyboards.py – All InlineKeyboardMarkup builders.
+keyboards.py — All InlineKeyboardMarkup builders.
 
-Real Telegram Bot API 9.4 colours via api_kwargs={"style": "..."}:
-  "success" = green   → accept, join, easy, confirm
-  "danger"  = red     → decline, hard, cancel, revenge
-  "primary" = blue    → stats, nav, action, play buttons
-  (no style)          → default grey: back, medium, neutral
+Button colours via Telegram Bot API 9.4 api_kwargs={"style": "..."}:
+  "success"  = green   — accept, join, easy, confirm, positive
+  "danger"   = red     — decline, hard, cancel, revenge, destructive
+  "primary"  = blue    — info, stats, leaderboard, rematch, navigation
+  (no style) = grey    — back, medium, neutral secondary actions
 """
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -13,12 +13,12 @@ from config import UPDATE_CHANNEL, BOT_USERNAME, SUPPORT_USERNAME
 from game import EMPTY, CELL_EMOJI
 
 
-# ── Builder helpers ───────────────────────────────────────
 def _b(text: str, data: str, style: str = "") -> InlineKeyboardButton:
     if style:
         return InlineKeyboardButton(text, callback_data=data,
                                     api_kwargs={"style": style})
     return InlineKeyboardButton(text, callback_data=data)
+
 
 def _u(text: str, url: str, style: str = "") -> InlineKeyboardButton:
     if style:
@@ -27,44 +27,49 @@ def _u(text: str, url: str, style: str = "") -> InlineKeyboardButton:
 
 
 # ─────────────────────────────────────────────────────────
-#  MAIN MENU
+#  DM WELCOME — fully coloured
 # ─────────────────────────────────────────────────────────
+
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            _u("➕ Add to Group", f"https://t.me/{BOT_USERNAME}?startgroup=true"),
-            _u("📢 Updates",      f"https://t.me/{UPDATE_CHANNEL.lstrip('@')}"),
+            _u("➕ Add to Group",   f"https://t.me/{BOT_USERNAME}?startgroup=true", "success"),
+            _u("📢 Updates",        f"https://t.me/{UPDATE_CHANNEL.lstrip('@')}",   "primary"),
         ],
         [
-            _b("Help & Commands",  "cb_help",        "primary"),
-            _b("My Stats",         "cb_stats",        "primary"),
+            _b("Help & Commands",   "cb_help",        "primary"),
+            _b("My Stats",          "cb_stats",        "primary"),
         ],
         [
-            _b("Leaderboard",      "cb_leaderboard",  "primary"),
-            _b("Language",         "cb_language"),
+            _b("Leaderboard",       "cb_leaderboard",  "primary"),
+            _b("Language",          "cb_language"),
         ],
         [
-            _u("Support", f"https://t.me/{SUPPORT_USERNAME}"),
+            _u("Support",           f"https://t.me/{SUPPORT_USERNAME}"),
         ],
     ])
 
 
+# ─────────────────────────────────────────────────────────
+#  GROUP WELCOME — fully coloured
+# ─────────────────────────────────────────────────────────
+
 def group_welcome_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            _b("⚔️ PvP Challenge",  "cb_mode_pvp",        "primary"),
-            _b("🤖 vs Bot",          "cb_mode_pve",        "primary"),
+            _b("⚔️ PvP Game",       "cb_mode_pvp",         "success"),
+            _b("🤖 vs Bot",          "cb_mode_pve",         "primary"),
         ],
         [
-            _b("🏆 Tournament",     "cb_mode_tournament",  "primary"),
-            _b("📅 Daily Puzzle",   "cb_mode_daily"),
+            _b("🏆 Tournament",     "cb_mode_tournament",   "primary"),
+            _b("📅 Daily Puzzle",   "cb_mode_daily",        "primary"),
         ],
         [
-            _b("My Stats",          "cb_stats",            "primary"),
-            _b("Leaderboard",       "cb_leaderboard",      "primary"),
+            _b("My Stats",          "cb_stats",             "primary"),
+            _b("Leaderboard",       "cb_leaderboard",       "primary"),
         ],
         [
-            _u("📢 Updates", f"https://t.me/{UPDATE_CHANNEL.lstrip('@')}"),
+            _u("📢 Updates",        f"https://t.me/{UPDATE_CHANNEL.lstrip('@')}"),
         ],
     ])
 
@@ -72,6 +77,7 @@ def group_welcome_kb() -> InlineKeyboardMarkup:
 # ─────────────────────────────────────────────────────────
 #  GAME BOARD
 # ─────────────────────────────────────────────────────────
+
 def board_kb(board: list, chat_id: int) -> InlineKeyboardMarkup:
     rows = []
     for r in range(3):
@@ -90,20 +96,18 @@ def board_kb(board: list, chat_id: int) -> InlineKeyboardMarkup:
 # ─────────────────────────────────────────────────────────
 #  /XO OPEN LOBBY
 # ─────────────────────────────────────────────────────────
+
 def xo_lobby_kb(chat_id: int, creator_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            _b("Join Game",  f"xo_join:{chat_id}:{creator_id}", "success"),
-        ],
-        [
-            _b("Cancel",     f"xo_cancel:{chat_id}:{creator_id}", "danger"),
-        ],
+        [_b("⚡ Join Game",  f"xo_join:{chat_id}:{creator_id}",   "success")],
+        [_b("Cancel",       f"xo_cancel:{chat_id}:{creator_id}", "danger")],
     ])
 
 
 # ─────────────────────────────────────────────────────────
-#  /PVP CHALLENGE
+#  PVP CHALLENGE BUTTONS
 # ─────────────────────────────────────────────────────────
+
 def challenge_kb(challenger_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         _b("Accept",  f"ch_accept:{challenger_id}",  "success"),
@@ -112,14 +116,16 @@ def challenge_kb(challenger_id: int) -> InlineKeyboardMarkup:
 
 
 # ─────────────────────────────────────────────────────────
-#  PVE SETUP
+#  PVE SETUP: DIFFICULTY → CHARACTER
 # ─────────────────────────────────────────────────────────
+
 def difficulty_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        _b("Easy",   "diff:easy",   "success"),
-        _b("Medium", "diff:medium"),
-        _b("Hard",   "diff:hard",   "danger"),
+        _b("Easy",    "diff:easy",   "success"),
+        _b("Medium",  "diff:medium"),
+        _b("Hard",    "diff:hard",   "danger"),
     ]])
+
 
 def character_kb(difficulty: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -137,36 +143,49 @@ def character_kb(difficulty: str) -> InlineKeyboardMarkup:
 # ─────────────────────────────────────────────────────────
 #  POST-GAME
 # ─────────────────────────────────────────────────────────
+
 def rematch_kb(mode: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        _b("Rematch",   f"rematch:{mode}", "primary"),
-        _b("Main Menu", "cb_main_menu"),
-    ]])
-
-def pvp_rematch_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        _b("New /xo Game", "xo_new", "primary"),
+        _b("🔄 Rematch",   f"rematch:{mode}", "primary"),
         _b("Main Menu",    "cb_main_menu"),
     ]])
 
-def revenge_kb() -> InlineKeyboardMarkup:
+
+def pvp_rematch_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        _b("REVENGE  ×2 Coins", "revenge",    "danger"),
-        _b("Main Menu",         "cb_main_menu"),
+        _b("🎮 New /xo Game",  "xo_new",       "primary"),
+        _b("Main Menu",        "cb_main_menu"),
     ]])
 
 
+def revenge_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_b("🔥 REVENGE  ×2 Coins", "revenge",       "danger")],
+        [_b("🔄 Rematch",           "rematch:pve",   "primary"),
+         _b("Main Menu",            "cb_main_menu")],
+    ])
+
+
 # ─────────────────────────────────────────────────────────
-#  NAV / LANG / TOURNAMENT / DAILY
+#  NAVIGATION / LANGUAGE / TOURNAMENT / DAILY
 # ─────────────────────────────────────────────────────────
+
 def back_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[_b("Back", "cb_main_menu")]])
+    return InlineKeyboardMarkup([[
+        _b("Back", "cb_main_menu"),
+    ]])
+
 
 def language_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [_b("English", "lang:en"), _b("العربية", "lang:ar"), _b("हिंदी", "lang:hi")],
+        [
+            _b("🇬🇧 English", "lang:en", "primary"),
+            _b("🇸🇦 العربية", "lang:ar"),
+            _b("🇮🇳 हिंदी",   "lang:hi"),
+        ],
         [_b("Back", "cb_main_menu")],
     ])
+
 
 def tourn_size_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
@@ -174,14 +193,16 @@ def tourn_size_kb() -> InlineKeyboardMarkup:
         _b("8 Players", "t_create:8", "primary"),
     ]])
 
+
 def tourn_lobby_kb(chat_id: int, creator_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            _b("Join",      f"t_join:{chat_id}",   "success"),
-            _b("Start Now", f"t_start:{chat_id}",  "primary"),
+            _b("Join",      f"t_join:{chat_id}",    "success"),
+            _b("Start Now", f"t_start:{chat_id}",   "primary"),
         ],
         [_b("Cancel", f"t_cancel:{chat_id}", "danger")],
     ])
+
 
 def daily_board_kb(board: list, chat_id: int, puzzle_idx: int) -> InlineKeyboardMarkup:
     rows = []
