@@ -1,33 +1,21 @@
 """
-handlers/game_handler.py  —  v5  (Lock-based, edit-only)
+handlers/game_handler.py  — Final clean version
 
-Architecture:
-  • Per-game asyncio.Lock  — serialises concurrent button taps.
-    When both PvP players tap at the same millisecond, the second
-    waits until the first is fully processed. Zero race conditions.
-
-  • Always edit_message_text, never send+delete.
-    One API call per move instead of two. Telegram handles message
-    edits gracefully; "not modified" is caught and ignored.
-    No stale message_id tracking needed.
-
-  • query stored on game["query"] when the game starts.
-    Every move edits that same message via query.edit_message_text().
-    Works for both PvE and PvP — no difference in logic.
-
-  • Result message always shown:
-    - Editing the board message on game end keeps the board visible
-      and transforms it into the result. Can never go blank.
-    - Plain-text fallback if markdown parsing fails on unusual names.
-
-Telegram policy compliance:
-  • One edit per move — well under the 20 edits/min per message limit.
-  • answer_callback_query() called immediately on every tap.
-  • No polling-mode spam; works correctly on webhook too.
+Key design decisions:
+  1. ParseMode.HTML everywhere — immune to user names with _ * [ ] ( ) etc.
+  2. html.escape() on every user-provided string before embedding in messages.
+  3. Per-game asyncio.Lock — serialises concurrent PvP button taps.
+  4. edit_message_text only — one API call per move, no send+delete.
+  5. _safe_edit never silently drops messages:
+       - "not modified" → silently ok (already correct)
+       - any other error → strips HTML tags and retries as plain text
+       - plain retry fails → logs warning but game state is still valid
 """
 
 import asyncio
+import html
 import logging
+import re
 import time
 
 from telegram import Update, Bot
@@ -55,11 +43,11 @@ from config import BOT_THINK_DELAY
 logger = logging.getLogger(__name__)
 
 # ── State ──────────────────────────────────────────────────
-games:      dict = {}   # chat_id → game dict
-game_locks: dict = {}   # chat_id → asyncio.Lock  (one lock per active game)
-xo_lobbies: dict = {}   # chat_id → lobby dict
-pending:    dict = {}   # chat_id → challenge (for @username fallback)
-rematch_ts: dict = {}   # chat_id → last rematch time
+games:      dict = {}
+game_locks: dict = {}
+xo_lobbies: dict = {}
+pending:    dict = {}
+rematch_ts: dict = {}
 
 REMATCH_COOLDOWN = 5.0
 
@@ -68,86 +56,94 @@ MILESTONES = {10: "milestone_10", 25: "milestone_25",
 
 
 # ─────────────────────────────────────────────────────────
-#  HELPERS
+#  HTML HELPERS
 # ─────────────────────────────────────────────────────────
 
-def mention(user) -> str:
-    name = user.full_name or user.username or str(user.id)
-    return f"[{name}](tg://user?id={user.id})"
+def e(s) -> str:
+    """Escape a value for safe embedding in Telegram HTML messages."""
+    return html.escape(str(s))
 
+def b(s) -> str:
+    return f"<b>{e(s)}</b>"
+
+def i(s) -> str:
+    return f"<i>{e(s)}</i>"
+
+def strip_html(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text)
+
+
+# ─────────────────────────────────────────────────────────
+#  GAME HELPERS
+# ─────────────────────────────────────────────────────────
+
+def _get_lock(chat_id: int) -> asyncio.Lock:
+    if chat_id not in game_locks:
+        game_locks[chat_id] = asyncio.Lock()
+    return game_locks[chat_id]
+
+def _release_lock(chat_id: int):
+    game_locks.pop(chat_id, None)
+
+def mention(user) -> str:
+    return f'<a href="tg://user?id={user.id}">{e(user.full_name)}</a>'
 
 def game_header(game: dict) -> str:
     if game["mode"] in ("pvp", "xo"):
-        xn = game["names"].get(game["x_player"], "Player 1")
-        on = game["names"].get(game["o_player"], "Player 2")
-        return f"❌ *{xn}*  ⚔️  ⭕ *{on}*"
-    xn    = game["names"].get(game["x_player"], "You")
+        xn = b(game["names"].get(game["x_player"], "Player 1"))
+        on = b(game["names"].get(game["o_player"], "Player 2"))
+        return f"❌ {xn}  ⚔️  ⭕ {on}"
+    xn    = b(game["names"].get(game["x_player"], "You"))
     char  = CHARACTERS.get(game.get("character", DEFAULT_CHARACTER), {})
-    cname = char.get("name", "🤖 Bot")
-    diff  = game.get("difficulty", "hard").capitalize()
-    return f"❌ *{xn}*  ⚔️  {cname} *[{diff}]*"
-
+    cname = e(char.get("name", "🤖 Bot"))
+    diff  = e(game.get("difficulty", "hard").capitalize())
+    return f"❌ {xn}  ⚔️  {cname} <b>[{diff}]</b>"
 
 def turn_mark(game: dict, uid) -> str:
     return "❌" if game["players"].get(uid) == X else "⭕"
-
 
 async def _get_lang(user_id: int) -> str:
     doc = await get_user(user_id)
     return (doc or {}).get("lang", "en")
 
 
-def _get_lock(chat_id: int) -> asyncio.Lock:
-    """Get or create the asyncio.Lock for a given game."""
-    if chat_id not in game_locks:
-        game_locks[chat_id] = asyncio.Lock()
-    return game_locks[chat_id]
-
-
-def _release_lock(chat_id: int):
-    """Remove lock when game is over (prevents unbounded growth)."""
-    game_locks.pop(chat_id, None)
-
-
 async def _safe_edit(query, text: str, reply_markup=None):
     """
-    Edit the board message. Handles all error cases:
-      • 'not modified'  → silently ignored (message already correct)
-      • RetryAfter      → waits and retries once
-      • parse error     → retries with plain text stripped of markdown
-      • anything else   → logged, not raised (game never hangs)
+    Edit a message with HTML parse mode.
+    Falls back to plain text (HTML stripped) on any parse error.
+    Silently ignores 'not modified'.
     """
-    kwargs = dict(parse_mode=ParseMode.MARKDOWN)
+    kw = {"parse_mode": ParseMode.HTML}
     if reply_markup:
-        kwargs["reply_markup"] = reply_markup
+        kw["reply_markup"] = reply_markup
 
     try:
-        await query.edit_message_text(text, **kwargs)
+        await query.edit_message_text(text, **kw)
         return
-    except RetryAfter as e:
-        await asyncio.sleep(e.retry_after + 0.5)
+    except RetryAfter as exc:
+        await asyncio.sleep(exc.retry_after + 1)
         try:
-            await query.edit_message_text(text, **kwargs)
+            await query.edit_message_text(text, **kw)
             return
         except TelegramError:
             pass
-    except BadRequest as e:
-        err = str(e).lower()
-        if "not modified" in err:
-            return   # already up to date — fine
-        if "can't parse" in err or "parse" in err:
-            # Name contains markdown special chars — strip and retry plain
-            import re
-            plain = re.sub(r"[*_`\[\]()]", "", text)
-            try:
-                await query.edit_message_text(
-                    plain, reply_markup=reply_markup
-                )
-                return
-            except TelegramError:
-                pass
-    except TelegramError as e:
-        logger.warning(f"_safe_edit: {e}")
+    except BadRequest as exc:
+        if "not modified" in str(exc).lower():
+            return
+        # HTML parse failure or any other BadRequest — try plain text
+    except TelegramError:
+        pass
+
+    # Plain-text fallback — strips all HTML tags
+    plain = strip_html(text)
+    try:
+        if reply_markup:
+            await query.edit_message_text(plain, reply_markup=reply_markup)
+        else:
+            await query.edit_message_text(plain)
+    except TelegramError as exc2:
+        if "not modified" not in str(exc2).lower():
+            logger.warning(f"_safe_edit plain fallback failed: {exc2}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -155,7 +151,6 @@ async def _safe_edit(query, text: str, reply_markup=None):
 # ─────────────────────────────────────────────────────────
 
 async def cmd_xo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/xo — Open lobby; anyone can tap Join."""
     chat_id = update.effective_chat.id
     user    = update.effective_user
     await save_user(user)
@@ -169,24 +164,23 @@ async def cmd_xo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if chat_id in xo_lobbies:
         await update.message.reply_text(
-            "⏳ An open lobby already exists. "
-            "Someone join it, or creator can /quit to cancel."
+            "⏳ Open lobby already exists here.\n"
+            "Someone join it, or creator uses /quit to cancel."
         )
         return
 
     msg = await update.message.reply_text(
-        f"🎮 *Open XO Game!*\n\n"
-        f"❌ *{user.full_name}* is looking for an opponent.\n\n"
-        f"Anyone — tap *Join Game* to play!\n\n"
+        f"🎮 <b>Open XO Game!</b>\n\n"
+        f"❌ <b>{e(user.full_name)}</b> is looking for an opponent.\n\n"
+        f"Anyone — tap <b>Join Game</b> to play!\n\n"
         f"⬜⬜⬜\n⬜⬜⬜\n⬜⬜⬜",
         reply_markup=xo_lobby_kb(chat_id, user.id),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
     xo_lobbies[chat_id] = {"creator": user, "msg_id": msg.message_id}
 
 
 async def cmd_pvp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/pvp @mention — direct start.  /pvp @username — challenge flow."""
     chat_id = update.effective_chat.id
     user    = update.effective_user
     await save_user(user)
@@ -208,42 +202,37 @@ async def cmd_pvp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 break
 
     if target:
-        # Direct start — both users known, no accept step
         game = new_pvp_game(user.id, target.id, user.full_name, target.full_name)
-        game["chat_id"] = chat_id
-        games[chat_id]  = game
-        game_locks[chat_id] = asyncio.Lock()
-
+        games[chat_id]       = game
+        game_locks[chat_id]  = asyncio.Lock()
         msg = await update.message.reply_text(
             f"{game_header(game)}\n\n"
-            f"🎮 *Game started!*\n\n"
+            f"🎮 <b>Game started!</b>\n\n"
             f"{board_to_emoji(game['board'])}\n\n"
-            f"➡️ *Turn:* {user.full_name}  ❌",
+            f"➡️ <b>Turn:</b> {e(user.full_name)}  ❌",
             reply_markup=board_kb(game["board"], chat_id),
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         game["msg_id"] = msg.message_id
-        # Store a fake query replacement — we'll use bot.edit for PvP
-        game["chat_id"]    = chat_id
-        game["message_id"] = msg.message_id
         return
 
     if ctx.args:
         uname = ctx.args[0].lstrip("@")
         pending[chat_id] = {"challenger": user, "target_username": uname.lower()}
         await update.message.reply_text(
-            t("challenge_sent", lang, challenger=mention(user), target=f"@{uname}"),
+            f"⚔️ {mention(user)} challenges <b>@{e(uname)}</b>!\n\n"
+            f"Tap a button to respond: ❌ vs ⭕",
             reply_markup=challenge_kb(user.id),
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         return
 
     await update.message.reply_text(
-        "⚔️ *PvP Mode*\n\n"
-        "• `/xo` — open lobby anyone can join\n"
-        "• `/pvp @mention` — tap name to direct-start\n"
-        "• `/pvp @username` — sends a challenge",
-        parse_mode=ParseMode.MARKDOWN,
+        "⚔️ <b>PvP Mode</b>\n\n"
+        "• /xo — open lobby, anyone can join\n"
+        "• /pvp @mention — tap their name to direct-start\n"
+        "• /pvp @username — sends a challenge request",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -259,9 +248,9 @@ async def cmd_pve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ctx.chat_data["pve_starter_id"] = user.id
     await update.message.reply_text(
-        t("choose_difficulty", lang, name=user.full_name),
+        f"🤖 <b>Player vs Bot</b>\n\n{e(user.full_name)}, choose difficulty:",
         reply_markup=difficulty_kb(),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -287,19 +276,18 @@ async def cmd_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pending.pop(chat_id)
     await save_user(user)
     game = new_pvp_game(challenger.id, user.id, challenger.full_name, user.full_name)
-    game["chat_id"] = chat_id
-    games[chat_id]  = game
+    games[chat_id]      = game
     game_locks[chat_id] = asyncio.Lock()
 
     msg = await update.message.reply_text(
         f"{game_header(game)}\n\n"
-        f"🎮 {t('game_started', lang)}\n\n"
+        f"🎮 <b>Game started!</b>\n\n"
         f"{board_to_emoji(game['board'])}\n\n"
-        f"➡️ *Turn:* {challenger.full_name}  ❌",
+        f"➡️ <b>Turn:</b> {e(challenger.full_name)}  ❌",
         reply_markup=board_kb(game["board"], chat_id),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
-    game["message_id"] = msg.message_id
+    game["msg_id"] = msg.message_id
 
 
 async def cmd_decline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -308,7 +296,8 @@ async def cmd_decline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if chat_id in pending:
         pending.pop(chat_id)
         await update.message.reply_text(
-            f"❌ {mention(user)} declined.", parse_mode=ParseMode.MARKDOWN
+            f"❌ {mention(user)} declined.",
+            parse_mode=ParseMode.HTML,
         )
     else:
         await update.message.reply_text("No pending challenge.")
@@ -321,7 +310,8 @@ async def cmd_quit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         games.pop(chat_id)
         _release_lock(chat_id)
         await update.message.reply_text(
-            f"🏳️ {mention(user)} quit.", parse_mode=ParseMode.MARKDOWN
+            f"🏳️ {mention(user)} quit the game.",
+            parse_mode=ParseMode.HTML,
         )
     elif chat_id in xo_lobbies:
         lobby = xo_lobbies.pop(chat_id)
@@ -344,14 +334,14 @@ async def cmd_board(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     game  = games[chat_id]
     tid   = game["turn"]
-    tname = "🤖 Bot" if tid == "bot" else game["names"].get(tid, "Player")
+    tname = "🤖 Bot" if tid == "bot" else e(game["names"].get(tid, "Player"))
     mark  = "" if tid == "bot" else turn_mark(game, tid)
     await update.message.reply_text(
         f"{game_header(game)}\n\n"
         f"{board_to_emoji(game['board'])}\n\n"
-        f"➡️ *Turn:* {tname}  {mark}",
+        f"➡️ <b>Turn:</b> {tname}  {mark}",
         reply_markup=board_kb(game["board"], chat_id),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -367,7 +357,7 @@ async def handle_game_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot     = ctx.bot
     lang    = await _get_lang(user.id)
 
-    # Always answer immediately — removes the loading spinner
+    # Answer immediately every time — removes Telegram's spinner
     try:
         await query.answer()
     except TelegramError:
@@ -380,12 +370,10 @@ async def handle_game_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # ── /xo: Join lobby ─────────────────────────
+    # ── /xo: join lobby ─────────────────────────
     if data.startswith("xo_join:"):
-        parts      = data.split(":")
-        cid        = int(parts[1])
-        creator_id = int(parts[2])
-
+        parts = data.split(":")
+        cid, creator_id = int(parts[1]), int(parts[2])
         if user.id == creator_id:
             try: await query.answer("You can't join your own game!", show_alert=True)
             except TelegramError: pass
@@ -398,33 +386,27 @@ async def handle_game_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try: await query.answer("A game is already running here!", show_alert=True)
             except TelegramError: pass
             return
-
         lobby   = xo_lobbies.pop(cid)
         creator = lobby["creator"]
         await save_user(user)
-
         game = new_pvp_game(creator.id, user.id, creator.full_name, user.full_name)
-        game["mode"]       = "xo"
-        game["chat_id"]    = cid
-        game["message_id"] = query.message.message_id
-        games[cid]         = game
-        game_locks[cid]    = asyncio.Lock()
-
+        game["mode"] = "xo"
+        games[cid]   = game
+        game_locks[cid] = asyncio.Lock()
         await _safe_edit(
             query,
             f"{game_header(game)}\n\n"
-            f"🎮 *{user.full_name}* joined!\n\n"
+            f"🎮 <b>{e(user.full_name)}</b> joined!\n\n"
             f"{board_to_emoji(game['board'])}\n\n"
-            f"➡️ *Turn:* {creator.full_name}  ❌",
+            f"➡️ <b>Turn:</b> {e(creator.full_name)}  ❌",
             reply_markup=board_kb(game["board"], cid),
         )
         return
 
-    # ── /xo: Cancel lobby ───────────────────────
+    # ── /xo: cancel lobby ───────────────────────
     if data.startswith("xo_cancel:"):
-        parts      = data.split(":")
-        cid        = int(parts[1])
-        creator_id = int(parts[2])
+        parts = data.split(":")
+        cid, creator_id = int(parts[1]), int(parts[2])
         if user.id != creator_id:
             try: await query.answer("Only the creator can cancel!", show_alert=True)
             except TelegramError: pass
@@ -433,25 +415,24 @@ async def handle_game_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _safe_edit(query, "❌ Lobby cancelled.")
         return
 
-    # ── /xo: New game from post-game button ──────
+    # ── /xo: new game from post-game button ─────
     if data == "xo_new":
         if chat_id in games:
             try: await query.answer(t("game_running", lang), show_alert=True)
             except TelegramError: pass
             return
-        xo_lobbies[chat_id] = {"creator": user,
-                                "msg_id": query.message.message_id}
+        xo_lobbies[chat_id] = {"creator": user, "msg_id": query.message.message_id}
         await _safe_edit(
             query,
-            f"🎮 *Open XO Game!*\n\n"
-            f"❌ *{user.full_name}* wants to play.\n\n"
-            f"Tap *Join Game* to become their opponent!\n\n"
+            f"🎮 <b>Open XO Game!</b>\n\n"
+            f"❌ <b>{e(user.full_name)}</b> wants to play.\n\n"
+            f"Tap <b>Join Game</b> to become their opponent!\n\n"
             f"⬜⬜⬜\n⬜⬜⬜\n⬜⬜⬜",
             reply_markup=xo_lobby_kb(chat_id, user.id),
         )
         return
 
-    # ── Accept challenge (via button) ────────────
+    # ── accept challenge (button) ────────────────
     if data.startswith("ch_accept:"):
         challenger_id = int(data.split(":")[1])
         if user.id == challenger_id:
@@ -461,35 +442,31 @@ async def handle_game_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if chat_id not in pending:
             await _safe_edit(query, t("challenge_expired", lang))
             return
-
         p          = pending.pop(chat_id)
         challenger = p["challenger"]
         await save_user(user)
         game = new_pvp_game(challenger.id, user.id, challenger.full_name, user.full_name)
-        game["chat_id"]    = chat_id
-        game["message_id"] = query.message.message_id
-        games[chat_id]     = game
+        games[chat_id]      = game
         game_locks[chat_id] = asyncio.Lock()
-
         await _safe_edit(
             query,
             f"{game_header(game)}\n\n"
-            f"🎮 {t('game_started', lang)}\n\n"
+            f"🎮 <b>Game started!</b>\n\n"
             f"{board_to_emoji(game['board'])}\n\n"
-            f"➡️ *Turn:* {challenger.full_name}  ❌",
+            f"➡️ <b>Turn:</b> {e(challenger.full_name)}  ❌",
             reply_markup=board_kb(game["board"], chat_id),
         )
         return
 
-    # ── Decline challenge (via button) ───────────
+    # ── decline challenge (button) ───────────────
     if data.startswith("ch_decline:"):
         pending.pop(chat_id, None)
-        await _safe_edit(query, f"❌ {user.full_name} declined.")
+        await _safe_edit(query, f"❌ {e(user.full_name)} declined.")
         return
 
-    # ── Difficulty picker ────────────────────────
+    # ── difficulty picker ────────────────────────
     if data.startswith("diff:"):
-        diff       = data.split(":")[1]
+        diff = data.split(":")[1]
         starter_id = ctx.chat_data.get("pve_starter_id")
         if starter_id and user.id != starter_id:
             try: await query.answer(t("only_challenger", lang), show_alert=True)
@@ -503,12 +480,12 @@ async def handle_game_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.chat_data["pve_starter_id"] = user.id
         await _safe_edit(
             query,
-            f"🤖 *Choose your opponent!*\n\nDifficulty: *{diff.capitalize()}*",
+            f"🤖 <b>Choose your opponent!</b>\n\nDifficulty: <b>{e(diff.capitalize())}</b>",
             reply_markup=character_kb(diff),
         )
         return
 
-    # ── Back to difficulty ───────────────────────
+    # ── back to difficulty ───────────────────────
     if data == "cb_pick_difficulty":
         starter_id = ctx.chat_data.get("pve_starter_id")
         if starter_id and user.id != starter_id:
@@ -517,12 +494,12 @@ async def handle_game_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await _safe_edit(
             query,
-            t("choose_difficulty", lang, name=user.full_name),
+            f"🤖 <b>Player vs Bot</b>\n\n{e(user.full_name)}, choose difficulty:",
             reply_markup=difficulty_kb(),
         )
         return
 
-    # ── Character → start PvE ───────────────────
+    # ── character selected → start PvE ──────────
     if data.startswith("char:"):
         _, diff, character = data.split(":")
         starter_id = ctx.chat_data.get("pve_starter_id")
@@ -536,27 +513,23 @@ async def handle_game_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await save_user(user)
         game = new_pve_game(user.id, user.full_name, diff, character)
-        game["chat_id"]    = chat_id
-        game["message_id"] = query.message.message_id
-        game["query"]      = query          # stored for future edits
-        games[chat_id]     = game
+        games[chat_id]      = game
         game_locks[chat_id] = asyncio.Lock()
         ctx.chat_data.pop("pve_starter_id", None)
         ctx.chat_data.pop("chosen_diff",    None)
-
         char_data = CHARACTERS.get(character, CHARACTERS[DEFAULT_CHARACTER])
         await _safe_edit(
             query,
             f"{game_header(game)}\n\n"
-            f"{char_data['intro']}\n\n"
-            f"_{t('you_are_x', lang)}_\n\n"
+            f"{e(char_data['intro'])}\n\n"
+            f"<i>You are ❌ — make the first move!</i>\n\n"
             f"{board_to_emoji(game['board'])}\n\n"
-            f"{t('your_turn', lang)}",
+            f"➡️ <b>Your turn!</b>",
             reply_markup=board_kb(game["board"], chat_id),
         )
         return
 
-    # ── Rematch (PvE) ────────────────────────────
+    # ── rematch (PvE) ────────────────────────────
     if data.startswith("rematch:"):
         mode = data.split(":")[1]
         now  = time.monotonic()
@@ -576,24 +549,21 @@ async def handle_game_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         rematch_ts[chat_id] = now
         await save_user(user)
         game = new_pve_game(user.id, user.full_name, "hard", DEFAULT_CHARACTER)
-        game["chat_id"]    = chat_id
-        game["message_id"] = query.message.message_id
-        game["query"]      = query
-        games[chat_id]     = game
+        games[chat_id]      = game
         game_locks[chat_id] = asyncio.Lock()
         char_data = CHARACTERS[DEFAULT_CHARACTER]
         await _safe_edit(
             query,
             f"{game_header(game)}\n\n"
-            f"🔄 *Rematch!*\n{char_data['intro']}\n\n"
-            f"_{t('you_are_x', lang)}_\n\n"
+            f"🔄 <b>Rematch!</b>\n{e(char_data['intro'])}\n\n"
+            f"<i>You are ❌ — make the first move!</i>\n\n"
             f"{board_to_emoji(game['board'])}\n\n"
-            f"{t('your_turn', lang)}",
+            f"➡️ <b>Your turn!</b>",
             reply_markup=board_kb(game["board"], chat_id),
         )
         return
 
-    # ── Revenge ──────────────────────────────────
+    # ── revenge ──────────────────────────────────
     if data == "revenge":
         if chat_id in games:
             try: await query.answer(t("game_running", lang), show_alert=True)
@@ -601,45 +571,38 @@ async def handle_game_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await save_user(user)
         game = new_pve_game(user.id, user.full_name, "hard", "devil", revenge=True)
-        game["chat_id"]    = chat_id
-        game["message_id"] = query.message.message_id
-        game["query"]      = query
-        games[chat_id]     = game
+        games[chat_id]      = game
         game_locks[chat_id] = asyncio.Lock()
         await _safe_edit(
             query,
             f"{game_header(game)}\n\n"
-            f"🔥 *REVENGE MODE — ×2 Coins!*\n"
-            f"😈 _\"Come then. Let's finish this.\"_\n\n"
-            f"_{t('you_are_x', lang)}_\n\n"
+            f"🔥 <b>REVENGE MODE — ×2 Coins!</b>\n"
+            f'😈 <i>"Come then. Let\'s finish this."</i>\n\n'
+            f"<i>You are ❌ — make the first move!</i>\n\n"
             f"{board_to_emoji(game['board'])}\n\n"
-            f"{t('your_turn', lang)}",
+            f"➡️ <b>Your turn!</b>",
             reply_markup=board_kb(game["board"], chat_id),
         )
         return
 
-    # ── Board move ───────────────────────────────
+    # ── board move ───────────────────────────────
     if data.startswith("mv:"):
         _, cid_s, idx_s = data.split(":")
         cid = int(cid_s)
         idx = int(idx_s)
-
-        lock = _get_lock(cid)
-        async with lock:
+        async with _get_lock(cid):
             await _handle_move(query, bot, cid, idx, user, lang, ctx)
         return
 
 
 # ─────────────────────────────────────────────────────────
-#  MOVE HANDLER  (always runs under per-game lock)
+#  MOVE HANDLER  (runs under per-game lock)
 # ─────────────────────────────────────────────────────────
 
 async def _handle_move(query, bot: Bot, cid: int, idx: int, user, lang: str, ctx):
     if cid not in games:
         return
-
     game = games[cid]
-
     if game["status"] != "playing":
         return
     if user.id not in game["players"]:
@@ -651,13 +614,9 @@ async def _handle_move(query, bot: Bot, cid: int, idx: int, user, lang: str, ctx
     if board[idx] != EMPTY:
         return
 
-    # Place mark
     mark = game["players"][user.id]
     board[idx] = mark
     game["move_history"].append((board[:], mark, idx))
-
-    # Update stored query so we always edit the right message
-    game["query"] = query
 
     winner = check_winner(board)
     if winner or is_draw(board):
@@ -665,29 +624,27 @@ async def _handle_move(query, bot: Bot, cid: int, idx: int, user, lang: str, ctx
         return
 
     if game["mode"] in ("pvp", "xo"):
-        # Switch turn
         all_pids     = list(game["players"].keys())
         game["turn"] = [p for p in all_pids if p != user.id][0]
         nxt_id       = game["turn"]
-        nxt_name     = game["names"][nxt_id]
+        nxt_name     = e(game["names"][nxt_id])
         nxt_mark     = turn_mark(game, nxt_id)
         await _safe_edit(
             query,
             f"{game_header(game)}\n\n"
             f"{board_to_emoji(board)}\n\n"
-            f"➡️ *Turn:* {nxt_name}  {nxt_mark}",
+            f"➡️ <b>Turn:</b> {nxt_name}  {nxt_mark}",
             reply_markup=board_kb(board, cid),
         )
 
     else:
-        # PvE — bot thinking edit
         character    = game.get("character", DEFAULT_CHARACTER)
         game["turn"] = "bot"
         await _safe_edit(
             query,
             f"{game_header(game)}\n\n"
             f"{board_to_emoji(board)}\n\n"
-            f"{char_thinking(character)}",
+            f"🤔 {e(char_thinking(character))}",
             reply_markup=board_kb(board, cid),
         )
 
@@ -708,13 +665,13 @@ async def _handle_move(query, bot: Bot, cid: int, idx: int, user, lang: str, ctx
             query,
             f"{game_header(game)}\n\n"
             f"{board_to_emoji(board)}\n\n"
-            f"{t('your_turn', lang)}",
+            f"➡️ <b>Your turn!</b>",
             reply_markup=board_kb(board, cid),
         )
 
 
 # ─────────────────────────────────────────────────────────
-#  END GAME  —  edits board message in-place, always shows result
+#  END GAME  —  edits board in-place, always shows result
 # ─────────────────────────────────────────────────────────
 
 async def _end_game(query, bot: Bot, game: dict, chat_id: int, winner_val, ctx):
@@ -738,16 +695,18 @@ async def _end_game(query, bot: Bot, game: dict, chat_id: int, winner_val, ctx):
         winner_id   = game["x_player"] if winner_val == X else game["o_player"]
         loser_id    = game["o_player"] if winner_val == X else game["x_player"]
         winner_name = game["names"].get(winner_id, "🤖 Bot")
-        result_text = f"🏆 *{winner_name}* wins! {CELL_EMOJI[winner_val]}"
+        result_text = (
+            f"🏆 <b>{e(winner_name)}</b> wins! {CELL_EMOJI[winner_val]}"
+        )
         if mode == "pve":
-            personality = char_result_msg(character,
-                                          "win" if winner_id == "bot" else "lose")
+            msg = char_result_msg(character, "win" if winner_id == "bot" else "lose")
+            personality = f"\n\n<i>{e(msg)}</i>"
     else:
-        result_text = "🤝 *It\'s a Draw!*"
+        result_text = "🤝 <b>It's a Draw!</b>"
         if mode == "pve":
-            personality = char_result_msg(character, "draw")
+            msg = char_result_msg(character, "draw")
+            personality = f"\n\n<i>{e(msg)}</i>"
 
-    # Stats / ELO
     x_id   = game["x_player"]
     o_id   = game["o_player"]
     x_name = game["names"].get(x_id, "Player")
@@ -770,13 +729,14 @@ async def _end_game(query, bot: Bot, game: dict, chat_id: int, winner_val, ctx):
             return
         sign = "+" if delta["elo_delta"] >= 0 else ""
         elo_lines.append(
-            f"📈 *{name}* ELO: {delta['old_elo']} → {delta['new_elo']} ({sign}{delta['elo_delta']})"
+            f"📈 <b>{e(name)}</b> ELO: {delta['old_elo']} → "
+            f"{delta['new_elo']} ({sign}{delta['elo_delta']})"
         )
         s, p = delta["streak"], delta["prev_streak"]
         if result == "win" and s in (3, 5, 10, 20) and s > p:
-            streak_lines.append(f"🔥 *{name}* is on a *{s}-win streak!*")
+            streak_lines.append(f"🔥 <b>{e(name)}</b> is on a <b>{s}-win streak!</b>")
         elif result != "win" and p >= 3:
-            streak_lines.append(f"💔 *{name}*\'s {p}-win streak is over!")
+            streak_lines.append(f"💔 <b>{e(name)}</b>'s {p}-win streak is over!")
         if grp_id and result == "win":
             g_wins = await update_group_stats(grp_id, uid, result, name)
             if g_wins in MILESTONES:
@@ -800,36 +760,40 @@ async def _end_game(query, bot: Bot, game: dict, chat_id: int, winner_val, ctx):
             and loser_id  and loser_id  != "bot"):
         await update_h2h(winner_id, loser_id)
 
-    # Bets
     bet_line = ""
     if winner_id and winner_id != "bot" and loser_id and loser_id != "bot":
         from handlers.coins_handler import resolve_bets
         bet_line = await resolve_bets(chat_id, winner_id, loser_id)
 
-    # Coins
     coins_line = ""
     if is_rev and winner_id and winner_id != "bot":
-        coins_line = f"\n💰 *{winner_name}* earned *+{COINS_WIN * 2} coins!* (×2 Revenge!)"
+        coins_line = (
+            f"\n💰 <b>{e(winner_name)}</b> earned "
+            f"<b>+{COINS_WIN * 2} coins!</b> (×2 Revenge!)"
+        )
         from database import add_coins as _ac
         await _ac(winner_id, COINS_WIN)
     elif winner_id and winner_id != "bot":
-        coins_line = f"\n💰 *{winner_name}* earned *+{COINS_WIN} coins!*"
+        coins_line = (
+            f"\n💰 <b>{e(winner_name)}</b> earned <b>+{COINS_WIN} coins!</b>"
+        )
     elif not winner_val:
-        coins_line = f"\n💰 Both players earned *+{COINS_DRAW} coins!*"
+        coins_line = f"\n💰 Both players earned <b>+{COINS_DRAW} coins!</b>"
 
-    analysis = analyse_game(game.get("move_history", []))
+    analysis_raw = analyse_game(game.get("move_history", []))
+    analysis     = f"\n\n{e(analysis_raw)}" if analysis_raw else ""
 
+    sep    = "\n\n" + "─" * 16 if (elo_lines or coins_line or personality or analysis) else ""
     extras = ""
-    if elo_lines:    extras += "\n\n" + "\n".join(elo_lines)
+    if elo_lines:    extras += "\n" + "\n".join(elo_lines)
     if coins_line:   extras += coins_line
     if bet_line:     extras += bet_line
-    if streak_lines: extras += "\n\n" + "\n".join(streak_lines)
+    if streak_lines: extras += "\n" + "\n".join(streak_lines)
     if personality:  extras += personality
-    if analysis:     extras += f"\n\n{analysis}"
+    if analysis:     extras += analysis
 
-    final = f"{header}\n\n{result_text}\n\n{board_emoji}{extras}"
+    final = f"{header}\n\n{result_text}\n\n{board_emoji}{sep}{extras}"
 
-    # Keyboard
     if is_tourn:
         kb = None
     elif mode == "pve" and winner_id == "bot" and game.get("difficulty") == "hard":
@@ -839,7 +803,6 @@ async def _end_game(query, bot: Bot, game: dict, chat_id: int, winner_val, ctx):
     else:
         kb = rematch_kb(mode)
 
-    # Always edit the existing board message — result appears in-place
     await _safe_edit(query, final, reply_markup=kb)
 
     if is_tourn and ctx and winner_id and winner_id != "bot":
